@@ -1,6 +1,6 @@
 # AttendBridge
 
-**ZKTeco MB360 → Odoo Attendance Middleware**
+**ZKTeco  → Odoo Attendance Middleware**
 
 AttendBridge is a lightweight Python/Flask server that bridges ZKTeco biometric attendance devices to [Odoo](https://www.odoo.com/) using the native iClock/ADMS push protocol. The device sends punches to AttendBridge; AttendBridge writes them to Odoo's `hr.attendance` module via XML-RPC — with duplicate detection, timezone conversion, stale-record handling, and an optional lateness-notification system built in.
 
@@ -37,7 +37,7 @@ Should work with any ZKTeco device running firmware that supports the iClock/ADM
 ```
 ┌─────────────┐   iClock/ADMS push   ┌──────────────────┐   XML-RPC   ┌───────────────┐
 │  ZKTeco     │ ──────────────────►  │  AttendBridge    │ ──────────► │  Odoo         │
-│  MB360      │                      │  (Flask, port    │             │  hr.attendance│
+│             │                      │  (Flask, port    │             │  hr.attendance│
 │  device     │ ◄──────────────────  │   8008)          │             │               │
 └─────────────┘   config response    └──────────────────┘             └───────────────┘
                                               │
