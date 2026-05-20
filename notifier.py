@@ -192,9 +192,17 @@ def send_lateness_email(
         if is_formal and Config.HR_EMAIL and Config.HR_EMAIL != to_email:
             recipients.append(Config.HR_EMAIL)
 
-        with smtplib.SMTP(Config.SMTP_HOST, Config.SMTP_PORT) as server:
+        # Port 465 = implicit TLS (SMTPS). Port 587/25 = plain or STARTTLS.
+        if Config.SMTP_PORT == 465:
+            smtp_cls = smtplib.SMTP_SSL
+            use_starttls = False
+        else:
+            smtp_cls = smtplib.SMTP
+            use_starttls = Config.SMTP_USE_TLS
+
+        with smtp_cls(Config.SMTP_HOST, Config.SMTP_PORT, timeout=30) as server:
             server.ehlo()
-            if Config.SMTP_USE_TLS:
+            if use_starttls:
                 server.starttls()
                 server.ehlo()
             if Config.SMTP_USER:
