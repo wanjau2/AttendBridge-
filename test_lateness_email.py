@@ -42,7 +42,7 @@ logging.basicConfig(
 log = logging.getLogger("test_lateness")
 
 
-def _action_for(occurrence: int) -> tuple[str, bool]:
+def _action_for(occurrence: int):
     """Mirror the disciplinary ladder used by lateness_tracker."""
     if occurrence <= 2:
         return ("System Record / Informal Caution", False)
