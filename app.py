@@ -403,18 +403,22 @@ def admin_auto_checkout():
     return Response("OK", mimetype="text/plain")
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Boot ───────────────────────────────────────────────────────────────────────
+# Runs on module import (gunicorn loads `app:app`) AND when executed directly.
+# Gunicorn must be configured with --workers 1 to avoid running the sweep N times.
+
+log.info("Starting MB360 → Odoo middleware")
+log.info(f"  Odoo: {Config.ODOO_URL}  DB: {Config.ODOO_DB}")
+
+if Config.AUTO_CHECKOUT_ENABLED:
+    log.info(
+        f"  Auto-checkout: WORK_END={Config.WORK_END_TIME} "
+        f"+ {Config.AUTO_CHECKOUT_GRACE_MINUTES}min grace"
+    )
+    threading.Thread(target=_sweep_loop, name="auto-checkout", daemon=True).start()
+
 
 if __name__ == "__main__":
-    log.info("Starting MB360 → Odoo middleware")
-    log.info(f"  Odoo: {Config.ODOO_URL}  DB: {Config.ODOO_DB}")
-    log.info(f"  Listening on 0.0.0.0:{Config.LISTEN_PORT}")
-
-    if Config.AUTO_CHECKOUT_ENABLED:
-        log.info(
-            f"  Auto-checkout: WORK_END={Config.WORK_END_TIME} "
-            f"+ {Config.AUTO_CHECKOUT_GRACE_MINUTES}min grace"
-        )
-        threading.Thread(target=_sweep_loop, name="auto-checkout", daemon=True).start()
-
+    # Local dev: Flask's built-in server. Production uses gunicorn (see restart.sh).
+    log.info(f"  Listening on 0.0.0.0:{Config.LISTEN_PORT} (Flask dev server)")
     app.run(host="0.0.0.0", port=Config.LISTEN_PORT, debug=False)
