@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import app; print\\('imports OK'\\)\")",
+      "Bash(where python *)",
+      "Bash(where py *)",
+      "Bash(C:\\\\Python314\\\\python.exe -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); ast.parse\\(open\\('odoo_client.py'\\).read\\(\\)\\); ast.parse\\(open\\('config.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "PowerShell(& 'C:\\\\Python314\\\\python.exe' -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['app.py','odoo_client.py','config.py','manage.py']]; print\\('syntax OK'\\)\")",
+      "PowerShell($env:PYTHONPATH=$null; $env:PYTHONHOME=$null; & 'C:\\\\Python314\\\\python.exe' -E -S -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['app.py','odoo_client.py','config.py','manage.py']]; print\\('syntax OK'\\)\")",
+      "PowerShell($env:PYTHONPATH=$null; $env:PYTHONHOME=$null; & 'C:\\\\Python314\\\\python.exe' -E -c \"import sys; sys.path.insert\\(0,'.'\\); import app; print\\('imports OK'\\); print\\('AUTO_CHECKOUT_ENABLED=', app.Config.AUTO_CHECKOUT_ENABLED\\); print\\('grace=', app.Config.AUTO_CHECKOUT_GRACE_MINUTES\\); print\\('end=', app.Config.WORK_END_TIME\\)\")",
+      "PowerShell($env:PYTHONPATH=$null; $env:PYTHONHOME=$null; & 'C:\\\\Users\\\\LENOVO\\\\AppData\\\\Local\\\\Python\\\\bin\\\\python.exe' -E -c \"import sys; sys.path.insert\\(0,'.'\\); import app; print\\('imports OK'\\); print\\('AUTO_CHECKOUT_ENABLED=', app.Config.AUTO_CHECKOUT_ENABLED\\); print\\('grace=', app.Config.AUTO_CHECKOUT_GRACE_MINUTES\\); print\\('end=', app.Config.WORK_END_TIME\\)\")",
+      "PowerShell($env:PYTHONPATH=$null; $env:PYTHONHOME=$null; $env:PATH='C:\\\\ZKBioTime\\\\Python311;C:\\\\ZKBioTime\\\\Python311\\\\Scripts;'+$env:PATH; & 'C:\\\\ZKBioTime\\\\Python311\\\\python.exe' -E -c \"import sys; sys.path.insert\\(0,'.'\\); import app; print\\('imports OK'\\); print\\('AUTO_CHECKOUT_ENABLED=', app.Config.AUTO_CHECKOUT_ENABLED\\); print\\('grace=', app.Config.AUTO_CHECKOUT_GRACE_MINUTES\\); print\\('end=', app.Config.WORK_END_TIME\\); print\\('category=', app.Config.OVERTIME_APPROVAL_CATEGORY\\)\")",
+      "PowerShell($env:PYTHONPATH=$null; $env:PYTHONHOME=$null; & 'C:\\\\Python314\\\\python.exe' -E -m pip install --quiet flask 2>&1 | Select-Object -Last 5)",
+      "PowerShell($env:PYTHONPATH=$null; $env:PYTHONHOME=$null; & 'C:\\\\Python314\\\\python.exe' -E -c \"import sys; sys.path.insert\\(0,'.'\\); import app; print\\('imports OK'\\); c=app.Config; print\\('enabled:', c.AUTO_CHECKOUT_ENABLED, '| grace:', c.AUTO_CHECKOUT_GRACE_MINUTES, '| end:', c.WORK_END_TIME, '| category:', c.OVERTIME_APPROVAL_CATEGORY\\); print\\('has _auto_checkout_sweep:', callable\\(app._auto_checkout_sweep\\)\\); print\\('has _sweep_loop:', callable\\(app._sweep_loop\\)\\); print\\('odoo has methods:', all\\(hasattr\\(app.odoo, m\\) for m in ['get_all_open_attendances','close_attendance','has_approved_overtime']\\)\\)\")"
+    ]
+  }
+}
