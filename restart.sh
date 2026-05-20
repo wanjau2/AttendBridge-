@@ -7,14 +7,16 @@
 #     sh restart.sh
 #
 # Logs:
-#   middleware.log        — application logs (from Python logging)
+#   middleware.log        — application logs (Python logging FileHandler)
 #   gunicorn-error.log    — gunicorn worker startup / crash output
 #   access.log            — HTTP access log
 #
 # Single worker is REQUIRED: the auto-checkout thread and in-process device
 # state would otherwise run/duplicate N times.
-
-set -e
+#
+# NOTE: deliberately NOT using `set -e` — busybox sh aborts on non-zero exit
+# from command substitution / pipelines (e.g. `kill -0` on a dead PID), which
+# is exactly what we need to tolerate when sweeping stale PIDs.
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_MODULE="app:app"
@@ -25,46 +27,77 @@ ERR_LOG="$APP_DIR/gunicorn-error.log"
 ACCESS_LOG="$APP_DIR/access.log"
 PID_FILE="$APP_DIR/middleware.pid"
 
-cd "$APP_DIR"
+cd "$APP_DIR" || exit 1
 
-echo "[restart] $(date '+%Y-%m-%d %H:%M:%S') — restarting middleware in $APP_DIR"
+log() { echo "[restart] $*"; }
+
+log "$(date '+%Y-%m-%d %H:%M:%S') — restarting middleware in $APP_DIR"
 
 # ── 1. Pull latest from GitHub ─────────────────────────────────────────────────
-echo "[restart] git pull"
-git pull --ff-only
+log "git pull"
+git pull --ff-only || { log "WARN: git pull failed — continuing with current code"; }
 
 # ── 2. Stop every running instance ─────────────────────────────────────────────
-# Match gunicorn serving our app and any straight `python app.py` leftovers.
-PIDS=$(pgrep -f "gunicorn.* $APP_MODULE" 2>/dev/null || true)
-PIDS="$PIDS $(pgrep -f "python.* $APP_DIR/app.py" 2>/dev/null || true)"
-PIDS="$PIDS $(pgrep -f "python.* app.py\$" 2>/dev/null || true)"
-if [ -f "$PID_FILE" ]; then
-    PIDS="$PIDS $(cat "$PID_FILE")"
-fi
-PIDS=$(echo "$PIDS" | tr ' ' '\n' | sort -u | grep -E '^[0-9]+$' || true)
+log "scanning for running instances"
 
-if [ -n "$PIDS" ]; then
-    echo "[restart] stopping PIDs: $(echo "$PIDS" | tr '\n' ' ')"
-    echo "$PIDS" | xargs -r kill 2>/dev/null || true
+# Collect candidate PIDs from multiple sources
+PIDS=""
+PIDS="$PIDS $(pgrep -f "gunicorn.* $APP_MODULE" 2>/dev/null)"
+PIDS="$PIDS $(pgrep -f "gunicorn:" 2>/dev/null)"
+PIDS="$PIDS $(pgrep -f "python.* $APP_DIR/app.py" 2>/dev/null)"
+PIDS="$PIDS $(pgrep -f "python.* app.py" 2>/dev/null)"
+if [ -f "$PID_FILE" ]; then
+    PIDS="$PIDS $(cat "$PID_FILE" 2>/dev/null)"
+fi
+
+# Filter to numeric, unique, and currently-alive PIDs only
+ALIVE=""
+for pid in $PIDS; do
+    case "$pid" in
+        ''|*[!0-9]*) continue ;;            # skip non-numeric
+    esac
+    if kill -0 "$pid" 2>/dev/null; then
+        # de-dup
+        case " $ALIVE " in
+            *" $pid "*) ;;
+            *) ALIVE="$ALIVE $pid" ;;
+        esac
+    fi
+done
+
+if [ -n "$ALIVE" ]; then
+    log "stopping PIDs:$ALIVE"
+    for pid in $ALIVE; do
+        kill "$pid" 2>/dev/null
+    done
     sleep 3
-    STILL=$(echo "$PIDS" | while read pid; do kill -0 "$pid" 2>/dev/null && echo "$pid"; done)
+
+    # Re-check; force-kill survivors
+    STILL=""
+    for pid in $ALIVE; do
+        if kill -0 "$pid" 2>/dev/null; then
+            STILL="$STILL $pid"
+        fi
+    done
     if [ -n "$STILL" ]; then
-        echo "[restart] force-killing: $(echo "$STILL" | tr '\n' ' ')"
-        echo "$STILL" | xargs -r kill -9 2>/dev/null || true
+        log "force-killing:$STILL"
+        for pid in $STILL; do
+            kill -9 "$pid" 2>/dev/null
+        done
+        sleep 1
     fi
 else
-    echo "[restart] no running instance found"
+    log "no running instance found"
 fi
 
-# Make sure the port is actually free before we bind
+# Free the port if anything still holds it
 if command -v fuser >/dev/null 2>&1; then
-    fuser -k "${PORT}/tcp" 2>/dev/null || true
+    fuser -k "${PORT}/tcp" 2>/dev/null
 fi
 
 rm -f "$PID_FILE"
 
-# ── 3. Relaunch under gunicorn ─────────────────────────────────────────────────
-# Find a usable gunicorn binary.
+# ── 3. Locate gunicorn ─────────────────────────────────────────────────────────
 GUNICORN=""
 for candidate in gunicorn /usr/local/bin/gunicorn /volume1/@appstore/py3k/usr/local/bin/gunicorn; do
     if command -v "$candidate" >/dev/null 2>&1; then
@@ -73,19 +106,17 @@ for candidate in gunicorn /usr/local/bin/gunicorn /volume1/@appstore/py3k/usr/lo
     fi
 done
 if [ -z "$GUNICORN" ]; then
-    # Fall back to `python3 -m gunicorn` if the script isn't on PATH
     if python3 -c "import gunicorn" 2>/dev/null; then
         GUNICORN="python3 -m gunicorn"
     else
-        echo "[restart] ERROR: gunicorn not installed. Run: pip3 install gunicorn"
+        log "ERROR: gunicorn not installed. Run: pip3 install gunicorn"
         exit 1
     fi
 fi
+log "gunicorn: $GUNICORN"
 
-echo "[restart] launching gunicorn on 0.0.0.0:$PORT (1 worker)"
-# stdout/stderr → /dev/null because gunicorn already writes its own logs and
-# the app uses a FileHandler — duplicating stdout into middleware.log would
-# produce double lines.
+# ── 4. Launch ──────────────────────────────────────────────────────────────────
+log "launching on 0.0.0.0:$PORT (1 worker, 4 threads)"
 nohup $GUNICORN \
     --workers 1 \
     --threads 4 \
@@ -97,15 +128,18 @@ nohup $GUNICORN \
     "$APP_MODULE" \
     >/dev/null 2>&1 &
 
-# Give gunicorn a moment to bind or fail
+# Give gunicorn time to bind or fail
 sleep 3
 
 if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    echo "[restart] started — PID $(cat "$PID_FILE")"
-    echo "[restart] logs: $LOG_FILE  /  $ERR_LOG  /  $ACCESS_LOG"
+    log "started — master PID $(cat "$PID_FILE")"
+    log "logs: $LOG_FILE  /  $ERR_LOG  /  $ACCESS_LOG"
     exit 0
 else
-    echo "[restart] ERROR: gunicorn failed to start. Last 30 lines of $ERR_LOG:"
-    [ -f "$ERR_LOG" ] && tail -n 30 "$ERR_LOG"
+    log "ERROR: gunicorn failed to start"
+    if [ -f "$ERR_LOG" ]; then
+        log "last 30 lines of $ERR_LOG:"
+        tail -n 30 "$ERR_LOG"
+    fi
     exit 1
 fi
