@@ -74,6 +74,18 @@ class Config:
     # Work end time in HH:MM (24hr)
     WORK_END_TIME = os.getenv("WORK_END_TIME", "17:00")
 
+    # ── Auto-checkout ──────────────────────────────────────────────────────────
+    # Minutes after WORK_END_TIME at which the sweep runs and stale open
+    # attendances (no approved overtime) get auto-closed.
+    AUTO_CHECKOUT_GRACE_MINUTES = int(os.getenv("AUTO_CHECKOUT_GRACE_MINUTES", "15"))
+
+    # Master switch for the background sweep
+    AUTO_CHECKOUT_ENABLED = os.getenv("AUTO_CHECKOUT_ENABLED", "true").lower() == "true"
+
+    # Approval category name in Odoo's Approvals app that represents overtime.
+    # Matched with ILIKE, so "Overtime" matches "Overtime Request" too.
+    OVERTIME_APPROVAL_CATEGORY = os.getenv("OVERTIME_APPROVAL_CATEGORY", "Overtime")
+
     # Minimum hours worked before a second punch counts as check-out.
     # Under this threshold → ignored as accidental double punch.
     # e.g. 4.0 → second punch within 4hrs ignored; after 4hrs = check-out
@@ -82,3 +94,9 @@ class Config:
     # If True, a second punch any time after 12:00 (noon) is treated as check-out
     # regardless of MIN_HOURS_BEFORE_CHECKOUT
     CHECKOUT_AFTER_NOON = os.getenv("CHECKOUT_AFTER_NOON", "true").lower() == "true"
+
+    # ── Multi-company ──────────────────────────────────────────────────────────
+    # Odoo company ID to create attendance records under.
+    # Find it in Settings → Companies → [company] → URL bar.
+    # Leave as 0 to use the integration user's default company.
+    ODOO_COMPANY_ID = int(os.getenv("ODOO_COMPANY_ID", "0"))

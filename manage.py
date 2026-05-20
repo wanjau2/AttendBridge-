@@ -15,13 +15,13 @@ from odoo_client import OdooClient
 
 
 def cmd_test_connection():
-    odoo = OdooClient(Config.ODOO_URL, Config.ODOO_DB, Config.ODOO_USER, Config.ODOO_PASSWORD)
+    odoo = OdooClient(Config.ODOO_URL, Config.ODOO_DB, Config.ODOO_USER, Config.ODOO_PASSWORD, Config.ODOO_COMPANY_ID)
     odoo._connect()
     print(f"✓ Connected to {Config.ODOO_URL} as uid={odoo._uid}")
 
 
 def cmd_list_employees():
-    odoo = OdooClient(Config.ODOO_URL, Config.ODOO_DB, Config.ODOO_USER, Config.ODOO_PASSWORD)
+    odoo = OdooClient(Config.ODOO_URL, Config.ODOO_DB, Config.ODOO_USER, Config.ODOO_PASSWORD, Config.ODOO_COMPANY_ID)
     employees = odoo._call(
         "hr.employee", "search_read",
         [[["active", "=", True]]],
@@ -46,7 +46,7 @@ def cmd_generate_map():
     This command writes a helper file 'employee_map_setup.json' with names
     so you can identify who is who, then you manually create employee_map.json.
     """
-    odoo = OdooClient(Config.ODOO_URL, Config.ODOO_DB, Config.ODOO_USER, Config.ODOO_PASSWORD)
+    odoo = OdooClient(Config.ODOO_URL, Config.ODOO_DB, Config.ODOO_USER, Config.ODOO_PASSWORD, Config.ODOO_COMPANY_ID)
     employees = odoo._call(
         "hr.employee", "search_read",
         [[["active", "=", True]]],

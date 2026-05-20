@@ -15,14 +15,15 @@ ODOO_DT_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 class OdooClient:
 
-    def __init__(self, url: str, db: str, username: str, password: str):
-        self.url = url.rstrip("/")
-        self.db = db
-        self.username = username
-        self.password = password
-        self._uid = None
-        self._models = None
-        self._common = None
+    def __init__(self, url: str, db: str, username: str, password: str, company_id: int = 0):
+        self.url        = url.rstrip("/")
+        self.db         = db
+        self.username   = username
+        self.password   = password
+        self.company_id = company_id   # 0 = use user's default company
+        self._uid       = None
+        self._models    = None
+        self._common    = None
 
     # ── Auth ───────────────────────────────────────────────────────────────────
 
@@ -49,16 +50,24 @@ class OdooClient:
     def _call(self, model: str, method: str, args: list, kwargs: dict = None):
         """Execute an XML-RPC call, reconnecting once on failure."""
         self._connect()
+
+        # Build context — inject company if configured
+        kw = dict(kwargs or {})
+        if self.company_id:
+            ctx = dict(kw.get("context", {}))
+            ctx["allowed_company_ids"] = [self.company_id]
+            ctx["force_company"]       = self.company_id
+            kw["context"] = ctx
+
         try:
             return self._models.execute_kw(
                 self.db, self._uid, self.password,
-                model, method, args, kwargs or {}
+                model, method, args, kw
             )
         except xmlrpc.client.Fault as e:
             log.error(f"[ODOO] XML-RPC fault: {e.faultString}")
             raise
         except Exception as e:
-            # Force re-auth on next call in case session expired
             self._uid = None
             log.warning(f"[ODOO] Connection error, will retry next call: {e}")
             raise
@@ -267,6 +276,89 @@ class OdooClient:
             return True
         except Exception as e:
             log.warning(f"[ODOO] Could not create disciplinary activity: {e}")
+            return False
+
+    def get_all_open_attendances(self) -> list:
+        """
+        Return all open attendance records (no check_out) across employees.
+        Each dict: {id, employee_id, check_in}.
+        """
+        recs = self._call(
+            "hr.attendance", "search_read",
+            [[["check_out", "=", False]]],
+            {"fields": ["id", "employee_id", "check_in"], "order": "check_in asc", "limit": 0}
+        )
+        out = []
+        for r in recs:
+            emp = r.get("employee_id")
+            # Odoo returns [id, name] for m2o fields
+            emp_id = emp[0] if isinstance(emp, (list, tuple)) and emp else emp
+            out.append({
+                "id":          r["id"],
+                "employee_id": emp_id,
+                "check_in":    str(r["check_in"])[:19] if r.get("check_in") else None,
+            })
+        return out
+
+    def close_attendance(self, attendance_id: int, check_out_time: datetime) -> bool:
+        """Set check_out on a specific attendance record by ID."""
+        self._call(
+            "hr.attendance", "write",
+            [[attendance_id], {"check_out": check_out_time.strftime(ODOO_DT_FORMAT)}]
+        )
+        log.debug(f"[ODOO] Closed attendance id={attendance_id} @ {check_out_time} UTC")
+        return True
+
+    def has_approved_overtime(self, employee_id: int, on_date) -> bool:
+        """
+        Return True if the employee has an approved approval.request in the
+        'Overtime' category that covers `on_date` (a datetime.date).
+
+        Matches request_status='approved' and category name ILIKE the configured
+        overtime category. Date match tries date_start/date_end first, then date.
+        """
+        from datetime import datetime as dt, time as _time
+
+        # Resolve employee → user (approval.request uses request_owner_id = res.users)
+        try:
+            emp = self._call(
+                "hr.employee", "read",
+                [[employee_id]],
+                {"fields": ["user_id"]}
+            )
+        except Exception as e:
+            log.warning(f"[ODOO] Could not read user_id for employee {employee_id}: {e}")
+            return False
+
+        if not emp:
+            return False
+        user_field = emp[0].get("user_id")
+        user_id = user_field[0] if isinstance(user_field, (list, tuple)) and user_field else None
+        if not user_id:
+            return False
+
+        # Import here to avoid circular at module load
+        from config import Config
+        day_start = dt.combine(on_date, _time.min).strftime(ODOO_DT_FORMAT)
+        day_end   = dt.combine(on_date, _time.max).strftime(ODOO_DT_FORMAT)
+        day_str   = on_date.strftime("%Y-%m-%d")
+
+        # Try (date_start <= end-of-day) AND (date_end >= start-of-day)
+        try:
+            count = self._call(
+                "approval.request", "search_count",
+                [[
+                    ["request_owner_id", "=", user_id],
+                    ["request_status",   "=", "approved"],
+                    ["category_id.name", "ilike", Config.OVERTIME_APPROVAL_CATEGORY],
+                    "|",
+                        "&", ["date_start", "<=", day_end], ["date_end", ">=", day_start],
+                        ["date", "=", day_str],
+                ]]
+            )
+            return count > 0
+        except Exception as e:
+            log.warning(f"[ODOO] Overtime lookup failed (employee {employee_id}): {e}")
             return False
 
     def get_open_attendance(self, employee_id: int):

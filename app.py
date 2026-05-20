@@ -5,6 +5,8 @@ The MB360 pushes attendance logs here; this server writes them to Odoo via XML-R
 """
 
 import logging
+import threading
+import time
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, Response
 from config import Config
@@ -29,7 +31,7 @@ log = logging.getLogger(__name__)
 
 # ── App setup ──────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-odoo = OdooClient(Config.ODOO_URL, Config.ODOO_DB, Config.ODOO_USER, Config.ODOO_PASSWORD)
+odoo = OdooClient(Config.ODOO_URL, Config.ODOO_DB, Config.ODOO_USER, Config.ODOO_PASSWORD, Config.ODOO_COMPANY_ID)
 emap = EmployeeMap(Config.EMPLOYEE_MAP_FILE)
 tracker = LatenessTracker(Config.LATENESS_STORE_FILE)
 
@@ -326,10 +328,93 @@ def _check_lateness(employee_id: int, pin: str, punch_time: datetime):
         log.warning(f"[LATENESS] No work email for {employee_name} — skipping email")
 
 
+# ── Auto-checkout sweep ────────────────────────────────────────────────────────
+
+_sweep_state = {"last_run_date": None}
+
+
+def _auto_checkout_sweep():
+    """
+    Close every open attendance whose employee does NOT have an approved
+    overtime request for today. Recorded check_out = WORK_END_TIME + grace
+    (local), converted to UTC.
+    """
+    h, m = map(int, Config.WORK_END_TIME.split(":"))
+    now_local = datetime.now(DEVICE_TZ)
+    cutoff_local = now_local.replace(
+        hour=h, minute=m, second=0, microsecond=0
+    ) + timedelta(minutes=Config.AUTO_CHECKOUT_GRACE_MINUTES)
+    cutoff_utc = cutoff_local.astimezone(timezone.utc).replace(tzinfo=None)
+
+    try:
+        open_recs = odoo.get_all_open_attendances()
+    except Exception as e:
+        log.error(f"[AUTO-OUT] Could not fetch open attendances: {e}")
+        return
+
+    log.info(f"[AUTO-OUT] Sweep starting — {len(open_recs)} open record(s)")
+    closed = 0
+    skipped_ot = 0
+    for rec in open_recs:
+        emp_id = rec["employee_id"]
+        try:
+            if odoo.has_approved_overtime(emp_id, now_local.date()):
+                skipped_ot += 1
+                log.info(f"[AUTO-OUT] employee_id={emp_id} has approved overtime — skip")
+                continue
+            odoo.close_attendance(rec["id"], cutoff_utc)
+            closed += 1
+            log.info(f"[AUTO-OUT] employee_id={emp_id} auto-closed at {cutoff_utc} UTC")
+        except Exception as e:
+            log.error(f"[AUTO-OUT] Failed to close attendance id={rec['id']}: {e}")
+
+    log.info(f"[AUTO-OUT] Sweep done — closed={closed} skipped_overtime={skipped_ot}")
+
+
+def _sweep_loop():
+    """
+    Daemon loop: every 60s check whether we've crossed WORK_END_TIME + grace
+    on a working day and haven't yet run today. If so, run the sweep once.
+    """
+    h, m = map(int, Config.WORK_END_TIME.split(":"))
+    while True:
+        try:
+            now_local = datetime.now(DEVICE_TZ)
+            today = now_local.date()
+            trigger = now_local.replace(
+                hour=h, minute=m, second=0, microsecond=0
+            ) + timedelta(minutes=Config.AUTO_CHECKOUT_GRACE_MINUTES)
+
+            is_workday = now_local.weekday() in Config.WORK_DAYS
+            already_ran = _sweep_state["last_run_date"] == today
+
+            if is_workday and not already_ran and now_local >= trigger:
+                _sweep_state["last_run_date"] = today
+                _auto_checkout_sweep()
+        except Exception as e:
+            log.error(f"[AUTO-OUT] Sweep loop error: {e}")
+        time.sleep(60)
+
+
+@app.route("/admin/auto-checkout", methods=["POST"])
+def admin_auto_checkout():
+    """Manual trigger for the auto-checkout sweep (testing / one-off use)."""
+    _auto_checkout_sweep()
+    return Response("OK", mimetype="text/plain")
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     log.info("Starting MB360 → Odoo middleware")
     log.info(f"  Odoo: {Config.ODOO_URL}  DB: {Config.ODOO_DB}")
     log.info(f"  Listening on 0.0.0.0:{Config.LISTEN_PORT}")
+
+    if Config.AUTO_CHECKOUT_ENABLED:
+        log.info(
+            f"  Auto-checkout: WORK_END={Config.WORK_END_TIME} "
+            f"+ {Config.AUTO_CHECKOUT_GRACE_MINUTES}min grace"
+        )
+        threading.Thread(target=_sweep_loop, name="auto-checkout", daemon=True).start()
+
     app.run(host="0.0.0.0", port=Config.LISTEN_PORT, debug=False)
