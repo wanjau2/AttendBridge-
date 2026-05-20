@@ -66,23 +66,44 @@ def _build_dummy_punch(minutes_late: int) -> datetime:
 
 # ── Mode 1: pure SMTP test ─────────────────────────────────────────────────────
 
-def mode_smtp_only(to_email: str, minutes_late: int, occurrence: int):
+def mode_smtp_only(to_email: str, minutes_late: int, occurrence: int, name_override: str = None):
     log.info(f"SMTP_HOST={Config.SMTP_HOST!r} SMTP_PORT={Config.SMTP_PORT} "
              f"TLS={Config.SMTP_USE_TLS} USER={Config.SMTP_USER!r} FROM={Config.SMTP_FROM!r}")
     if not Config.SMTP_HOST:
         log.error("SMTP_HOST is blank in .env — fix that first, no email can be sent.")
         sys.exit(2)
 
+    # Resolve employee_name: explicit override > Odoo lookup by email > generic fallback
+    employee_name = name_override
+    if not employee_name:
+        try:
+            from odoo_client import OdooClient
+            odoo = OdooClient(Config.ODOO_URL, Config.ODOO_DB, Config.ODOO_USER,
+                              Config.ODOO_PASSWORD, Config.ODOO_COMPANY_ID)
+            found = odoo._call(
+                "hr.employee", "search_read",
+                [[["work_email", "=ilike", to_email]]],
+                {"fields": ["id", "name"], "limit": 1},
+            )
+            if found:
+                employee_name = found[0]["name"]
+                log.info(f"Resolved {to_email} → {employee_name!r} via Odoo work_email")
+        except Exception as e:
+            log.warning(f"Could not look up employee by email in Odoo: {e}")
+    if not employee_name:
+        employee_name = "TEST USER"
+        log.warning("Using fallback name 'TEST USER' — pass --name or set work_email in Odoo")
+
     action, is_formal = _action_for(occurrence)
     punch = _build_dummy_punch(minutes_late)
     month = punch.strftime("%Y-%m")
 
-    log.info(f"Sending sample lateness email to {to_email} "
-             f"(minutes_late={minutes_late}, occurrence={occurrence}, formal={is_formal})")
+    log.info(f"Sending sample lateness email to {to_email} (name={employee_name!r}, "
+             f"minutes_late={minutes_late}, occurrence={occurrence}, formal={is_formal})")
 
     ok = send_lateness_email(
         to_email=to_email,
-        employee_name="TEST USER",
+        employee_name=employee_name,
         punch_time=punch,
         minutes_late=minutes_late,
         occurrence=occurrence,
@@ -191,11 +212,15 @@ def main():
     p.add_argument("--occurrence", type=int, default=1,
                    help="Which occurrence # to render in the email (default: 1). "
                         "Use 3+ to test the formal/HR-cc variant. Ignored by --simulate-punch.")
+    p.add_argument("--name", default=None,
+                   help="Override the employee name shown in the email body. "
+                        "Only used by --smtp-only. If omitted, the script looks up the "
+                        "name in Odoo by work_email; falls back to 'TEST USER'.")
 
     args = p.parse_args()
 
     if args.smtp_only:
-        mode_smtp_only(args.smtp_only, args.minutes_late, args.occurrence)
+        mode_smtp_only(args.smtp_only, args.minutes_late, args.occurrence, args.name)
     elif args.employee:
         mode_employee(args.employee, args.minutes_late, args.occurrence)
     elif args.simulate_punch:

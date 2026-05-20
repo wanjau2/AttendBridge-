@@ -155,7 +155,8 @@ def _build_email(
     msg["Subject"] = subject
     msg["From"]    = Config.SMTP_FROM
     msg["To"]      = to_email
-    if cc_hr and Config.HR_EMAIL and Config.HR_EMAIL != to_email:
+    # HR is CC'd on every lateness notification (not just formal ones)
+    if Config.HR_EMAIL and Config.HR_EMAIL != to_email:
         msg["Cc"] = Config.HR_EMAIL
 
     msg.attach(MIMEText(html, "html"))
@@ -185,11 +186,12 @@ def send_lateness_email(
         msg = _build_email(
             to_email, employee_name, punch_time,
             minutes_late, occurrence, month, action, is_formal,
-            cc_hr=is_formal,
+            cc_hr=True,
         )
 
+        # HR is CC'd on every lateness email, regardless of formal status
         recipients = [to_email]
-        if is_formal and Config.HR_EMAIL and Config.HR_EMAIL != to_email:
+        if Config.HR_EMAIL and Config.HR_EMAIL != to_email:
             recipients.append(Config.HR_EMAIL)
 
         # Port 465 = implicit TLS (SMTPS). Port 587/25 = plain or STARTTLS.

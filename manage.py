@@ -100,11 +100,72 @@ def cmd_build_map():
         print(f"  Skipped {len(skipped)} employees with no PIN: {', '.join(skipped)}")
 
 
+def cmd_audit_map():
+    """
+    For every PIN in employee_map.json, fetch the Odoo employee's current
+    name and work_email. Flags missing emails and unknown employee IDs.
+    Run this any time after onboarding to make sure lateness notifications
+    will reach a real inbox.
+    """
+    from employee_map import EmployeeMap
+    emap = EmployeeMap(Config.EMPLOYEE_MAP_FILE)
+    if not emap._map:
+        print(f"No mappings in {Config.EMPLOYEE_MAP_FILE}. Run generate-map / build-map first.")
+        sys.exit(1)
+
+    odoo = OdooClient(Config.ODOO_URL, Config.ODOO_DB, Config.ODOO_USER,
+                      Config.ODOO_PASSWORD, Config.ODOO_COMPANY_ID)
+
+    # Batch read in one XML-RPC call
+    ids = list({int(v) for v in emap._map.values()})
+    records = odoo._call(
+        "hr.employee", "read",
+        [ids],
+        {"fields": ["id", "name", "work_email", "active"]},
+    )
+    by_id = {r["id"]: r for r in records}
+
+    rows = []
+    missing_email = 0
+    missing_record = 0
+    inactive = 0
+    for pin, emp_id in sorted(emap._map.items(), key=lambda kv: int(kv[0])):
+        rec = by_id.get(int(emp_id))
+        if not rec:
+            rows.append((pin, emp_id, "<NOT FOUND IN ODOO>", "—", False))
+            missing_record += 1
+            continue
+        name  = rec.get("name") or "<no name>"
+        email = rec.get("work_email") or ""
+        active = bool(rec.get("active"))
+        if not email:
+            missing_email += 1
+        if not active:
+            inactive += 1
+        rows.append((pin, emp_id, name, email or "<missing>", active))
+
+    # Print table
+    print(f"\n{'PIN':>4}  {'ID':>5}  {'A':<1}  {'Name':<32}  {'Work Email'}")
+    print("-" * 90)
+    for pin, emp_id, name, email, active in rows:
+        flag = " " if active else "✗"
+        print(f"{pin:>4}  {emp_id:>5}  {flag:<1}  {name[:32]:<32}  {email}")
+    print("-" * 90)
+    print(f"Total mapped: {len(rows)}")
+    print(f"  Missing work_email:   {missing_email}")
+    print(f"  Inactive in Odoo:     {inactive}")
+    print(f"  Not found in Odoo:    {missing_record}")
+    if missing_email or missing_record or inactive:
+        print("\nFix in Odoo: Employees → [person] → Work Information → Work Email.")
+        sys.exit(2)
+
+
 COMMANDS = {
     "test-connection": cmd_test_connection,
     "list-employees": cmd_list_employees,
     "generate-map": cmd_generate_map,
     "build-map": cmd_build_map,
+    "audit-map": cmd_audit_map,
 }
 
 if __name__ == "__main__":
