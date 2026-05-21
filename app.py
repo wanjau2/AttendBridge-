@@ -213,21 +213,54 @@ def _process_punch(line: str, sn: str):
     log.debug(f"[PARSE] PIN={pin} direction={direction} time={punch_time} (UTC)")
 
     if direction == 0:
-        # ── Check-In ───────────────────────────────────────────────────────────
-        # Guard: if there's already an open record within 60 seconds → duplicate
+        # ── Check-In (or override-to-checkout) ─────────────────────────────────
         open_rec = odoo.get_open_attendance(employee_id)
         if open_rec:
-            check_in_utc = datetime.strptime(open_rec["check_in"], "%Y-%m-%d %H:%M:%S")
+            check_in_utc  = datetime.strptime(open_rec["check_in"], "%Y-%m-%d %H:%M:%S")
             seconds_since = (punch_time - check_in_utc).total_seconds()
+            hours_since   = seconds_since / 3600.0
+
+            # Duplicate (rapid re-tap)
             if seconds_since < 60:
                 log.warning(f"[DUP] Duplicate check-in PIN={pin} ({seconds_since:.0f}s after last) — ignored")
                 return
-            # Open record exists but this is a new check-in (e.g. forgot to check out yesterday)
-            # Close the stale record at midnight before creating the new check-in
-            log.warning(
-                f"[STALE] PIN={pin} has unclosed record from {open_rec['check_in']} UTC — closing it"
-            )
-            odoo.check_out(employee_id, check_in_utc.replace(hour=23, minute=59, second=59))
+
+            # 4h-rule: any same-day punch ≥ MIN_HOURS_BEFORE_CHECKOUT after an open
+            # check-in is treated as a check-out, regardless of what the device's
+            # direction field says. Fixes firmware quirk where evening exits are
+            # reported with direction=0.
+            same_day = check_in_utc.date() == punch_time.date()
+            if same_day and hours_since >= Config.MIN_HOURS_BEFORE_CHECKOUT:
+                odoo.check_out(employee_id, punch_time)
+                log.info(
+                    f"[OUT] employee_id={employee_id} PIN={pin} at {punch_time} UTC "
+                    f"(auto-detected: {hours_since:.1f}h after check-in)"
+                )
+                return
+
+            # Different calendar day — yesterday's record was never closed.
+            # Close it at WORK_END_TIME + grace of the original date, then create
+            # today's check-in below.
+            if not same_day:
+                h, m = map(int, Config.WORK_END_TIME.split(":"))
+                ci_local = check_in_utc.replace(tzinfo=timezone.utc).astimezone(DEVICE_TZ)
+                close_local = ci_local.replace(
+                    hour=h, minute=m, second=0, microsecond=0
+                ) + timedelta(minutes=Config.AUTO_CHECKOUT_GRACE_MINUTES)
+                close_utc = close_local.astimezone(timezone.utc).replace(tzinfo=None)
+                log.warning(
+                    f"[STALE] PIN={pin} unclosed record from {open_rec['check_in']} UTC "
+                    f"— closing at {close_utc} UTC"
+                )
+                odoo.check_out(employee_id, close_utc)
+            else:
+                # Same day, <4h since check-in, not a duplicate — likely an
+                # accidental re-tap on the check-in side. Ignore.
+                log.warning(
+                    f"[SKIP] PIN={pin} re-punch {hours_since:.1f}h after check-in "
+                    f"(< {Config.MIN_HOURS_BEFORE_CHECKOUT}h) — ignored"
+                )
+                return
 
         odoo.check_in(employee_id, punch_time)
         log.info(f"[IN]  employee_id={employee_id} PIN={pin} at {punch_time} UTC")
