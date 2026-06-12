@@ -71,6 +71,12 @@ class Config:
     # HR email — copied on all formal disciplinary notifications
     HR_EMAIL = os.getenv("HR_EMAIL", "")
 
+    # Manager email — CC'd starting at the 4th monthly lateness occurrence
+    MANAGER_EMAIL = os.getenv("MANAGER_EMAIL", "")
+
+    # Occurrence number at which the manager starts being CC'd
+    MANAGER_CC_OCCURRENCE = int(os.getenv("MANAGER_CC_OCCURRENCE", "4"))
+
     # Work end time in HH:MM (24hr)
     WORK_END_TIME = os.getenv("WORK_END_TIME", "17:00")
 

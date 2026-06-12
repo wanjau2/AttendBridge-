@@ -141,6 +141,8 @@ All configuration is via environment variables, loaded from `.env` on startup.
 | `SMTP_PASSWORD` | — | SMTP password |
 | `SMTP_FROM` | — | From address |
 | `HR_EMAIL` | — | CC'd on formal disciplinary emails |
+| `MANAGER_EMAIL` | — | CC'd from the 4th monthly lateness occurrence onward |
+| `MANAGER_CC_OCCURRENCE` | `4` | Occurrence at which the manager starts being CC'd |
 | `ADMIN_TOKEN` | _(blank = no auth)_ | Token for admin UI/API |
 
 ---

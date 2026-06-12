@@ -155,9 +155,20 @@ def _build_email(
     msg["Subject"] = subject
     msg["From"]    = Config.SMTP_FROM
     msg["To"]      = to_email
-    # HR is CC'd on every lateness notification (not just formal ones)
+
+    # Build the CC list:
+    #  - HR is CC'd on every lateness notification (not just formal ones)
+    #  - The manager is CC'd starting at the configured occurrence (default 4th)
+    cc_list = []
     if Config.HR_EMAIL and Config.HR_EMAIL != to_email:
-        msg["Cc"] = Config.HR_EMAIL
+        cc_list.append(Config.HR_EMAIL)
+    if (Config.MANAGER_EMAIL
+            and occurrence >= Config.MANAGER_CC_OCCURRENCE
+            and Config.MANAGER_EMAIL != to_email
+            and Config.MANAGER_EMAIL not in cc_list):
+        cc_list.append(Config.MANAGER_EMAIL)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
 
     msg.attach(MIMEText(html, "html"))
     return msg
@@ -189,10 +200,15 @@ def send_lateness_email(
             cc_hr=True,
         )
 
-        # HR is CC'd on every lateness email, regardless of formal status
+        # HR is CC'd on every lateness email, regardless of formal status.
+        # The manager is CC'd starting at the configured occurrence (default 4th).
         recipients = [to_email]
         if Config.HR_EMAIL and Config.HR_EMAIL != to_email:
             recipients.append(Config.HR_EMAIL)
+        if (Config.MANAGER_EMAIL
+                and occurrence >= Config.MANAGER_CC_OCCURRENCE
+                and Config.MANAGER_EMAIL not in recipients):
+            recipients.append(Config.MANAGER_EMAIL)
 
         # Port 465 = implicit TLS (SMTPS). Port 587/25 = plain or STARTTLS.
         if Config.SMTP_PORT == 465:
