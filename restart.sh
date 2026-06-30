@@ -97,25 +97,44 @@ fi
 
 rm -f "$PID_FILE"
 
-# ── 3. Locate gunicorn ─────────────────────────────────────────────────────────
+# ── 3. Ensure the virtualenv exists and has our deps ───────────────────────────
+# The middleware runs from its own venv so that Synology/DSM updates (which
+# periodically wipe /usr/lib/python3.8/site-packages) can't take attendance
+# down. If the venv is missing or broken, rebuild it from requirements.txt.
+VENV="$APP_DIR/venv"
+if [ ! -x "$VENV/bin/gunicorn" ] || ! "$VENV/bin/python" -c "import flask" 2>/dev/null; then
+    log "venv missing or incomplete — (re)building $VENV"
+    python3 -m venv "$VENV" 2>/dev/null || python3 -m venv --without-pip "$VENV"
+    "$VENV/bin/python" -m ensurepip --upgrade 2>/dev/null
+    "$VENV/bin/python" -m pip install --upgrade pip >/dev/null 2>&1
+    if [ -f "$APP_DIR/requirements.txt" ]; then
+        "$VENV/bin/pip" install -r "$APP_DIR/requirements.txt" || {
+            log "ERROR: failed to install requirements into venv"; exit 1; }
+    else
+        "$VENV/bin/pip" install flask gunicorn || {
+            log "ERROR: failed to install flask/gunicorn into venv"; exit 1; }
+    fi
+fi
+
+# ── 4. Locate gunicorn (prefer the venv) ───────────────────────────────────────
 GUNICORN=""
-for candidate in gunicorn /usr/local/bin/gunicorn /volume1/@appstore/py3k/usr/local/bin/gunicorn; do
+for candidate in "$VENV/bin/gunicorn" gunicorn /usr/local/bin/gunicorn /volume1/@appstore/py3k/usr/local/bin/gunicorn; do
     if command -v "$candidate" >/dev/null 2>&1; then
         GUNICORN="$candidate"
         break
     fi
 done
 if [ -z "$GUNICORN" ]; then
-    if python3 -c "import gunicorn" 2>/dev/null; then
-        GUNICORN="python3 -m gunicorn"
+    if "$VENV/bin/python" -c "import gunicorn" 2>/dev/null; then
+        GUNICORN="$VENV/bin/python -m gunicorn"
     else
-        log "ERROR: gunicorn not installed. Run: pip3 install gunicorn"
+        log "ERROR: gunicorn not installed. Run: $VENV/bin/pip install gunicorn"
         exit 1
     fi
 fi
 log "gunicorn: $GUNICORN"
 
-# ── 4. Launch ──────────────────────────────────────────────────────────────────
+# ── 5. Launch ──────────────────────────────────────────────────────────────────
 log "launching on 0.0.0.0:$PORT (1 worker, 4 threads)"
 nohup $GUNICORN \
     --workers 1 \
