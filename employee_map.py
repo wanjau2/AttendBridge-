@@ -16,6 +16,7 @@ class EmployeeMap:
     def __init__(self, filepath: str):
         self.filepath = filepath
         self._map = {}
+        self._mtime = None
         self.load()
 
     def load(self):
@@ -27,6 +28,7 @@ class EmployeeMap:
                 "then fill in the PIN column."
             )
             self._map = {}
+            self._mtime = None
             return
 
         with open(self.filepath, "r") as f:
@@ -38,10 +40,27 @@ class EmployeeMap:
             for k, v in data.items()
             if not str(k).startswith("_")
         }
+        self._mtime = os.path.getmtime(self.filepath)
         log.info(f"[MAP] Loaded {len(self._map)} employee mapping(s) from {self.filepath}")
+
+    def _maybe_reload(self):
+        """Reload automatically if the file changed on disk since last load.
+
+        Lets `manage.py onboard` add a new employee while the server is
+        running — no restart needed. Punches are infrequent, so the extra
+        stat() per lookup is negligible.
+        """
+        try:
+            current = os.path.getmtime(self.filepath)
+        except OSError:
+            return
+        if current != self._mtime:
+            log.info("[MAP] Map file changed on disk — hot-reloading.")
+            self.load()
 
     def get(self, pin):
         """Return the Odoo employee_id for a given device PIN, or None."""
+        self._maybe_reload()
         return self._map.get(str(pin))
 
     def reload(self):

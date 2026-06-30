@@ -2,10 +2,12 @@
 manage.py — CLI helpers for setup and maintenance.
 
 Usage:
+    python manage.py onboard               # Add one new employee in a single step
     python manage.py list-employees        # Print all Odoo employees with their IDs
+    python manage.py audit-map             # Check every mapped PIN has a valid email
     python manage.py test-connection       # Verify Odoo credentials work
-    python manage.py reload-map            # Reload employee_map.json (if server running)
-    python manage.py generate-map          # Generate a starter employee_map.json
+    python manage.py generate-map          # Generate a starter employee_map_setup.json
+    python manage.py build-map             # Build employee_map.json from the setup file
 """
 
 import json
@@ -53,14 +55,20 @@ def cmd_generate_map():
         {"fields": ["id", "name"], "order": "name asc", "limit": 0}
     )
 
+    # Preserve any PINs already filled in (from employee_map.json) so that
+    # re-running this command to pick up new hires doesn't wipe existing work.
+    known_pin = {v: k for k, v in _load_map().items()}  # odoo_id → pin
+
     setup = {
         "_instructions": (
             "Fill in the device_pin for each employee. "
             "Find PINs on the MB360: Menu → User Mgmt → All Users. "
-            "Then run: python manage.py build-map"
+            "Then run: python manage.py build-map  "
+            "(Tip: 'python manage.py onboard' does this in one step.)"
         ),
         "employees": [
-            {"odoo_id": e["id"], "name": e["name"], "device_pin": None}
+            {"odoo_id": e["id"], "name": e["name"],
+             "device_pin": known_pin.get(e["id"])}
             for e in employees
         ]
     }
@@ -70,6 +78,139 @@ def cmd_generate_map():
 
     print(f"✓ Wrote employee_map_setup.json ({len(employees)} employees)")
     print("  Fill in 'device_pin' for each person, then run: python manage.py build-map")
+
+
+def _load_map():
+    """Return the current PIN→odoo_id map as a dict (empty if no file)."""
+    try:
+        with open(Config.EMPLOYEE_MAP_FILE) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    return {str(k): int(v) for k, v in data.items() if not str(k).startswith("_")}
+
+
+def _save_map(mapping):
+    """Write the PIN→odoo_id map to disk (sorted by PIN for readability)."""
+    ordered = {k: mapping[k] for k in sorted(mapping, key=lambda x: int(x))}
+    with open(Config.EMPLOYEE_MAP_FILE, "w") as f:
+        json.dump(ordered, f, indent=2)
+
+
+def cmd_onboard():
+    """
+    Onboard one new employee in a single step — no JSON editing, no restart.
+
+        python manage.py onboard                     # interactive picker
+        python manage.py onboard --pin 14 --id 33    # pin → odoo employee id
+        python manage.py onboard --pin 14 --name Jane
+
+    Validates the employee exists, is active, and has a work_email, then
+    merges the new PIN into employee_map.json (existing entries are kept).
+    The running server picks up the change automatically.
+    """
+    args = sys.argv[2:]
+
+    def _flag(name):
+        if name in args:
+            i = args.index(name)
+            if i + 1 < len(args):
+                return args[i + 1]
+        return None
+
+    pin       = _flag("--pin")
+    want_id   = _flag("--id")
+    want_name = _flag("--name")
+
+    odoo = OdooClient(Config.ODOO_URL, Config.ODOO_DB, Config.ODOO_USER,
+                      Config.ODOO_PASSWORD, Config.ODOO_COMPANY_ID)
+    employees = odoo._call(
+        "hr.employee", "search_read",
+        [[["active", "=", True]]],
+        {"fields": ["id", "name", "work_email"], "order": "name asc", "limit": 0},
+    )
+    by_id = {e["id"]: e for e in employees}
+
+    mapping = _load_map()
+    mapped_ids = {int(v) for v in mapping.values()}
+
+    # ── 1. Pick the employee ──────────────────────────────────────────────────
+    emp = None
+    if want_id:
+        emp = by_id.get(int(want_id))
+        if not emp:
+            print(f"✗ No active Odoo employee with id={want_id}.")
+            sys.exit(1)
+    elif want_name:
+        matches = [e for e in employees if want_name.lower() in e["name"].lower()]
+        if not matches:
+            print(f"✗ No active employee matching {want_name!r}.")
+            sys.exit(1)
+        if len(matches) > 1:
+            print(f"Multiple employees match {want_name!r}:")
+            for e in matches:
+                print(f"   id={e['id']:<4} {e['name']}")
+            print("Re-run with --id <id> to disambiguate.")
+            sys.exit(1)
+        emp = matches[0]
+    else:
+        # Interactive: list employees that aren't mapped yet
+        unmapped = [e for e in employees if e["id"] not in mapped_ids]
+        if not unmapped:
+            print("All active employees are already mapped. Nothing to onboard.")
+            return
+        print("\nEmployees not yet mapped to a device PIN:")
+        print(f"{'#':>3}  {'ID':>5}  {'Name':<32}  {'Work Email'}")
+        print("-" * 70)
+        for idx, e in enumerate(unmapped, 1):
+            print(f"{idx:>3}  {e['id']:>5}  {e['name'][:32]:<32}  {e.get('work_email') or '<missing>'}")
+        choice = input("\nPick employee number (or blank to cancel): ").strip()
+        if not choice:
+            print("Cancelled.")
+            return
+        try:
+            emp = unmapped[int(choice) - 1]
+        except (ValueError, IndexError):
+            print("✗ Invalid choice.")
+            sys.exit(1)
+
+    # ── 2. Get the PIN ────────────────────────────────────────────────────────
+    if not pin:
+        pin = input(f"Device PIN for {emp['name']}: ").strip()
+    if not pin or not pin.isdigit():
+        print(f"✗ PIN must be a number (got {pin!r}).")
+        sys.exit(1)
+    pin = str(int(pin))  # normalise (strip leading zeros)
+
+    # ── 3. Validate before writing ────────────────────────────────────────────
+    if pin in mapping and mapping[pin] != emp["id"]:
+        other = by_id.get(mapping[pin], {}).get("name", f"id={mapping[pin]}")
+        ans = input(f"⚠ PIN {pin} is already mapped to {other}. Reassign to "
+                    f"{emp['name']}? [y/N]: ").strip().lower()
+        if ans != "y":
+            print("Cancelled.")
+            return
+
+    existing_pin = next((p for p, i in mapping.items() if i == emp["id"]), None)
+    if existing_pin and existing_pin != pin:
+        ans = input(f"⚠ {emp['name']} is already mapped to PIN {existing_pin}. "
+                    f"Move to PIN {pin}? [y/N]: ").strip().lower()
+        if ans != "y":
+            print("Cancelled.")
+            return
+        del mapping[existing_pin]
+
+    if not emp.get("work_email"):
+        print(f"⚠ {emp['name']} has no work_email in Odoo — lateness emails "
+              "will have nowhere to go until you add one\n"
+              "  (Odoo → Employees → Work Information → Work Email).")
+
+    # ── 4. Write & confirm ────────────────────────────────────────────────────
+    mapping[pin] = emp["id"]
+    _save_map(mapping)
+    print(f"\n✓ Onboarded {emp['name']}: PIN {pin} → Odoo id {emp['id']}")
+    print(f"  employee_map.json now has {len(mapping)} mappings.")
+    print("  The running server will pick this up automatically (hot-reload).")
 
 
 def cmd_build_map():
@@ -166,6 +307,7 @@ COMMANDS = {
     "generate-map": cmd_generate_map,
     "build-map": cmd_build_map,
     "audit-map": cmd_audit_map,
+    "onboard": cmd_onboard,
 }
 
 if __name__ == "__main__":
