@@ -2,6 +2,15 @@
 MB360 → Odoo Online Middleware
 Implements the ZKTeco iClock/ADMS push protocol.
 The MB360 pushes attendance logs here; this server writes them to Odoo via XML-RPC.
+
+ZMM501-NF28VF-Ver1.0.8 (the device at Chambers) puts the verify method in
+field 2, not a reliable in/out flag:
+
+    0 = password, 1 = fingerprint, 15 = face, 255 = automatic state
+
+Only 0 and 1 are treated as explicit check-in / check-out. Every other value
+is decided from the employee's open attendance in Odoo: no open row means
+check-in, an open row at least MIN_HOURS_BEFORE_CHECKOUT later means check-out.
 """
 
 import logging
@@ -17,6 +26,10 @@ from notifier import send_lateness_email
 
 # EAT is UTC+3. Odoo Online always stores datetimes in UTC.
 DEVICE_TZ = timezone(timedelta(hours=Config.DEVICE_TIMEZONE_OFFSET))
+
+# Values of ATTLOG field 2 that this firmware uses as an explicit direction.
+# Anything else is a verify method or an automatic state and must not be dropped.
+EXPLICIT_DIRECTIONS = (0, 1)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -39,6 +52,16 @@ tracker = LatenessTracker(Config.LATENESS_STORE_FILE)
 _device_state = {}
 
 
+def _touch_device(sn: str):
+    """Record that the terminal just contacted us."""
+    _device_state.update({
+        "sn":           sn,
+        "ip":           request.remote_addr,
+        "last_seen":    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "last_seen_ts": time.time(),
+    })
+
+
 # ── ADMS endpoints ─────────────────────────────────────────────────────────────
 
 @app.route("/iclock/cdata", methods=["GET"])
@@ -46,31 +69,29 @@ def device_init():
     """
     Called by the MB360 on startup / reconnect.
     We return the device configuration (polling interval, flags, etc.).
+
+    ATTLOGStamp stays 9999 on purpose. The terminal is already pushing live
+    punches; a stamp of 0 would make it replay its entire on-device history.
     """
-    import time
     sn = request.args.get("SN", "UNKNOWN")
-    _device_state.update({
-        "sn":          sn,
-        "ip":          request.remote_addr,
-        "last_seen":   datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "last_seen_ts": time.time(),
-    })
+    _touch_device(sn)
     log.info(f"[INIT] Device connected: SN={sn} IP={request.remote_addr}")
 
-    # iClock configuration response — device will use these settings
+    # iClock configuration response — device will use these settings.
+    # ZKTeco firmware expects CRLF line endings.
     body = (
-        f"GET OPTION FROM: {sn}\n"
-        "ATTLOGStamp=9999\n"
-        "OPERLOGStamp=9999\n"
-        "ATTPHOTOStamp=9999\n"
-        "ErrorDelay=30\n"
-        f"Delay={Config.PUSH_INTERVAL_SECONDS}\n"
-        "TransTimes=00:00;23:59\n"
-        "TransInterval=1\n"
-        "TransFlag=TransData AttLog\n"
-        f"TimeZone={Config.DEVICE_TIMEZONE_OFFSET}\n"
-        "Realtime=1\n"
-        "Encrypt=0\n"
+        f"GET OPTION FROM: {sn}\r\n"
+        "ATTLOGStamp=9999\r\n"
+        "OPERLOGStamp=9999\r\n"
+        "ATTPHOTOStamp=9999\r\n"
+        "ErrorDelay=30\r\n"
+        f"Delay={Config.PUSH_INTERVAL_SECONDS}\r\n"
+        "TransTimes=00:00;23:59\r\n"
+        "TransInterval=1\r\n"
+        "TransFlag=TransData AttLog\r\n"
+        f"TimeZone={Config.DEVICE_TIMEZONE_OFFSET}\r\n"
+        "Realtime=1\r\n"
+        "Encrypt=0\r\n"
     )
     return Response(body, mimetype="text/plain")
 
@@ -80,15 +101,14 @@ def receive_attendance():
     """
     The MB360 POSTs attendance records here.
     Query param: table=ATTLOG
-    Body (one line per punch):
-        <PIN> \\t <DateTime> \\t <Verified> \\t <Status> \\t <WorkCode> \\t <Reserved>
-    Status: 0=check-in, 1=check-out, 4=break-out, 5=break-in, 255=auto
+    Body (one line per punch, tab-separated):
+        <PIN> <DateTime> <Verified> <Status> <WorkCode> <Reserved>
     """
     sn = request.args.get("SN", "UNKNOWN")
     table = request.args.get("table", "")
 
     if table != "ATTLOG":
-        log.debug(f"[SKIP] Ignoring table={table} from SN={sn}")
+        log.info(f"[SKIP] Ignoring table={table} from SN={sn}")
         return Response("OK: 0", mimetype="text/plain")
 
     raw = request.data.decode("utf-8", errors="replace").strip()
@@ -98,29 +118,42 @@ def receive_attendance():
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
     log.info(f"[ATTLOG] SN={sn} | {len(lines)} record(s) received")
 
-    processed = 0
+    accepted = 0
+    retry = False
     for line in lines:
         try:
-            _process_punch(line, sn)
-            processed += 1
+            if _process_punch(line, sn):
+                accepted += 1
+            else:
+                # Unmapped PIN. Refuse the ACK so the terminal keeps the punch
+                # and sends it again after the map is fixed.
+                retry = True
         except Exception as e:
             log.error(f"[ERROR] Failed to process line '{line}': {e}")
+            retry = True
 
-    return Response(f"OK: {processed}", mimetype="text/plain")
+    if retry:
+        # A body that does not start with OK tells the terminal to keep the
+        # batch and post it again. "OK: 0" would delete the punch.
+        return Response(f"ERROR: {accepted}", mimetype="text/plain")
+
+    return Response(f"OK: {accepted}", mimetype="text/plain")
 
 
 @app.route("/iclock/getrequest", methods=["GET"])
 def heartbeat():
     """Periodic keepalive from the device. Respond with OK."""
-    import time
     sn = request.args.get("SN", "UNKNOWN")
-    _device_state.update({
-        "sn":           sn,
-        "ip":           request.remote_addr,
-        "last_seen":    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "last_seen_ts": time.time(),
-    })
+    _touch_device(sn)
     log.debug(f"[HEARTBEAT] SN={sn}")
+    return Response("OK", mimetype="text/plain")
+
+
+@app.route("/iclock/ping", methods=["GET"])
+def ping():
+    """Secondary keepalive. This firmware calls it about every four minutes."""
+    sn = request.args.get("SN", "UNKNOWN")
+    _touch_device(sn)
     return Response("OK", mimetype="text/plain")
 
 
@@ -135,8 +168,6 @@ def device_cmd_ack():
 @app.route("/health", methods=["GET"])
 def health():
     """Live health check — tests Odoo connection and reports device last-seen time."""
-    import time
-
     result = {
         "middleware": "ok",
         "odoo_url":   Config.ODOO_URL,
@@ -175,30 +206,42 @@ def health():
 
 # ── Core punch logic ───────────────────────────────────────────────────────────
 
-def _process_punch(line: str, sn: str):
+def _direction_for(pin: str, field2: int) -> int:
+    """
+    Return 0 (check-in path) or 1 (check-out path) for one ATTLOG field 2.
+
+    0 and 1 keep the original meaning. Face punches arrive as 15 and were
+    previously discarded at DEBUG level after the terminal had already been
+    told the upload succeeded.
+    """
+    if field2 in EXPLICIT_DIRECTIONS:
+        return field2
+
+    log.info(
+        "[AUTO] PIN=%s field2=%s — deciding in/out from open attendance",
+        pin, field2,
+    )
+    return 0
+
+
+def _process_punch(line: str, sn: str) -> bool:
     """
     Parse one ATTLOG line and write the appropriate record to Odoo.
 
-    ZMM501-NF28VF firmware ATTLOG format (tab-separated):
-        PIN  DateTime            Verified  Status  WorkCode ...
-        9    2026-04-30 08:56:42  1         1       0  ...
-        9    2026-04-30 08:57:56  0         1       0  ...
-
-    IMPORTANT — firmware quirk on ZMM501-NF28VF Ver1.0.8:
-        field[3] Status  → always 1, IGNORE
-        field[2] Verified → encodes punch direction on this firmware:
-                             0 = Check-In
-                             1 = Check-Out
+    Returns True when the terminal may drop the line (it was stored, or it
+    was an intentional duplicate / re-tap). Returns False when the line must
+    be retried, which today means the PIN is not in the employee map.
     """
+    log.info("[RAW] SN=%s %s", sn, line)
+
     parts = line.split("\t")
     if len(parts) < 4:
         raise ValueError(f"Too few fields: {line!r}")
 
     pin    = parts[0].strip()
     dt_str = parts[1].strip()
-
-    # ZMM501 firmware: direction is in field[2], not field[3]
-    direction = int(parts[2].strip())   # 0 = Check-In, 1 = Check-Out
+    field2 = int(parts[2].strip())
+    direction = _direction_for(pin, field2)
 
     # Parse timestamp — device sends local EAT, convert to UTC for Odoo
     punch_time_local = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=DEVICE_TZ)
@@ -207,85 +250,95 @@ def _process_punch(line: str, sn: str):
     # Look up the Odoo employee_id for this device PIN
     employee_id = emap.get(pin)
     if not employee_id:
-        log.warning(f"[MAP] No Odoo employee mapped for PIN={pin}. Skipping.")
-        return
+        log.warning(f"[MAP] No Odoo employee mapped for PIN={pin}. Holding for retry.")
+        return False
 
-    log.debug(f"[PARSE] PIN={pin} direction={direction} time={punch_time} (UTC)")
+    log.info(
+        "[PARSE] PIN=%s field2=%s direction=%s time=%s UTC",
+        pin, field2, direction, punch_time,
+    )
 
     if direction == 0:
-        # ── Check-In (or override-to-checkout) ─────────────────────────────────
-        open_rec = odoo.get_open_attendance(employee_id)
-        if open_rec:
-            check_in_utc  = datetime.strptime(open_rec["check_in"], "%Y-%m-%d %H:%M:%S")
-            seconds_since = (punch_time - check_in_utc).total_seconds()
-            hours_since   = seconds_since / 3600.0
+        _apply_check_in(pin, employee_id, punch_time)
+    else:
+        _apply_check_out(pin, employee_id, punch_time)
+    return True
 
-            # Duplicate (rapid re-tap)
-            if seconds_since < 60:
-                log.warning(f"[DUP] Duplicate check-in PIN={pin} ({seconds_since:.0f}s after last) — ignored")
-                return
 
-            # 4h-rule: any same-day punch ≥ MIN_HOURS_BEFORE_CHECKOUT after an open
-            # check-in is treated as a check-out, regardless of what the device's
-            # direction field says. Fixes firmware quirk where evening exits are
-            # reported with direction=0.
-            same_day = check_in_utc.date() == punch_time.date()
-            if same_day and hours_since >= Config.MIN_HOURS_BEFORE_CHECKOUT:
-                odoo.check_out(employee_id, punch_time)
-                log.info(
-                    f"[OUT] employee_id={employee_id} PIN={pin} at {punch_time} UTC "
-                    f"(auto-detected: {hours_since:.1f}h after check-in)"
-                )
-                return
-
-            # Different calendar day — yesterday's record was never closed.
-            # Close it at WORK_END_TIME + grace of the original date, then create
-            # today's check-in below.
-            if not same_day:
-                h, m = map(int, Config.WORK_END_TIME.split(":"))
-                ci_local = check_in_utc.replace(tzinfo=timezone.utc).astimezone(DEVICE_TZ)
-                close_local = ci_local.replace(
-                    hour=h, minute=m, second=0, microsecond=0
-                ) + timedelta(minutes=Config.AUTO_CHECKOUT_GRACE_MINUTES)
-                close_utc = close_local.astimezone(timezone.utc).replace(tzinfo=None)
-                log.warning(
-                    f"[STALE] PIN={pin} unclosed record from {open_rec['check_in']} UTC "
-                    f"— closing at {close_utc} UTC"
-                )
-                odoo.check_out(employee_id, close_utc)
-            else:
-                # Same day, <4h since check-in, not a duplicate — likely an
-                # accidental re-tap on the check-in side. Ignore.
-                log.warning(
-                    f"[SKIP] PIN={pin} re-punch {hours_since:.1f}h after check-in "
-                    f"(< {Config.MIN_HOURS_BEFORE_CHECKOUT}h) — ignored"
-                )
-                return
-
-        odoo.check_in(employee_id, punch_time)
-        log.info(f"[IN]  employee_id={employee_id} PIN={pin} at {punch_time} UTC")
-        _check_lateness(employee_id, pin, punch_time)
-
-    elif direction == 1:
-        # ── Check-Out ──────────────────────────────────────────────────────────
-        # Guard: if no open record, nothing to close
-        open_rec = odoo.get_open_attendance(employee_id)
-        if not open_rec:
-            log.warning(f"[SKIP] Check-out for PIN={pin} but no open record in Odoo — ignored")
-            return
-
+def _apply_check_in(pin: str, employee_id: int, punch_time: datetime):
+    """
+    Open a check-in, or turn this punch into a check-out when an open
+    attendance from earlier today is already past the minimum hours.
+    """
+    open_rec = odoo.get_open_attendance(employee_id)
+    if open_rec:
         check_in_utc  = datetime.strptime(open_rec["check_in"], "%Y-%m-%d %H:%M:%S")
         seconds_since = (punch_time - check_in_utc).total_seconds()
+        hours_since   = seconds_since / 3600.0
 
+        # Duplicate (rapid re-tap)
         if seconds_since < 60:
-            log.warning(f"[DUP] Duplicate check-out PIN={pin} ({seconds_since:.0f}s after check-in) — ignored")
+            log.warning(f"[DUP] Duplicate check-in PIN={pin} ({seconds_since:.0f}s after last) — ignored")
             return
 
-        odoo.check_out(employee_id, punch_time)
-        log.info(f"[OUT] employee_id={employee_id} PIN={pin} at {punch_time} UTC")
+        # 4h-rule: any same-day punch ≥ MIN_HOURS_BEFORE_CHECKOUT after an open
+        # check-in is treated as a check-out, regardless of what the device's
+        # direction field says. Evening exits on this firmware are not marked
+        # as check-out.
+        same_day = check_in_utc.date() == punch_time.date()
+        if same_day and hours_since >= Config.MIN_HOURS_BEFORE_CHECKOUT:
+            odoo.check_out(employee_id, punch_time)
+            log.info(
+                f"[OUT] employee_id={employee_id} PIN={pin} at {punch_time} UTC "
+                f"(auto-detected: {hours_since:.1f}h after check-in)"
+            )
+            return
 
-    else:
-        log.debug(f"[SKIP] Unknown direction={direction} for PIN={pin}")
+        # Different calendar day — yesterday's record was never closed.
+        # Close it at WORK_END_TIME + grace of the original date, then create
+        # today's check-in below.
+        if not same_day:
+            h, m = map(int, Config.WORK_END_TIME.split(":"))
+            ci_local = check_in_utc.replace(tzinfo=timezone.utc).astimezone(DEVICE_TZ)
+            close_local = ci_local.replace(
+                hour=h, minute=m, second=0, microsecond=0
+            ) + timedelta(minutes=Config.AUTO_CHECKOUT_GRACE_MINUTES)
+            close_utc = close_local.astimezone(timezone.utc).replace(tzinfo=None)
+            log.warning(
+                f"[STALE] PIN={pin} unclosed record from {open_rec['check_in']} UTC "
+                f"— closing at {close_utc} UTC"
+            )
+            odoo.check_out(employee_id, close_utc)
+        else:
+            # Same day, <4h since check-in, not a duplicate — likely an
+            # accidental re-tap on the check-in side. Ignore.
+            log.warning(
+                f"[SKIP] PIN={pin} re-punch {hours_since:.1f}h after check-in "
+                f"(< {Config.MIN_HOURS_BEFORE_CHECKOUT}h) — ignored"
+            )
+            return
+
+    odoo.check_in(employee_id, punch_time)
+    log.info(f"[IN]  employee_id={employee_id} PIN={pin} at {punch_time} UTC")
+    _check_lateness(employee_id, pin, punch_time)
+
+
+def _apply_check_out(pin: str, employee_id: int, punch_time: datetime):
+    """Close the open attendance. An explicit check-out with nothing open is ignored."""
+    open_rec = odoo.get_open_attendance(employee_id)
+    if not open_rec:
+        log.warning(f"[SKIP] Check-out for PIN={pin} but no open record in Odoo — ignored")
+        return
+
+    check_in_utc  = datetime.strptime(open_rec["check_in"], "%Y-%m-%d %H:%M:%S")
+    seconds_since = (punch_time - check_in_utc).total_seconds()
+
+    if seconds_since < 60:
+        log.warning(f"[DUP] Duplicate check-out PIN={pin} ({seconds_since:.0f}s after check-in) — ignored")
+        return
+
+    odoo.check_out(employee_id, punch_time)
+    log.info(f"[OUT] employee_id={employee_id} PIN={pin} at {punch_time} UTC")
 
 
 # ── Lateness detection ─────────────────────────────────────────────────────────
@@ -442,6 +495,7 @@ def admin_auto_checkout():
 
 log.info("Starting MB360 → Odoo middleware")
 log.info(f"  Odoo: {Config.ODOO_URL}  DB: {Config.ODOO_DB}")
+log.info("  ATTLOG: field2 0/1 are explicit in/out; face and other codes use open attendance")
 
 if Config.AUTO_CHECKOUT_ENABLED:
     log.info(
