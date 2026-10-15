@@ -101,6 +101,12 @@ class Config:
     # regardless of MIN_HOURS_BEFORE_CHECKOUT
     CHECKOUT_AFTER_NOON = os.getenv("CHECKOUT_AFTER_NOON", "true").lower() == "true"
 
+    # One attendance cycle per local calendar day.
+    # After someone has checked in (and optionally out / auto-checked-out) today,
+    # further punches that day are ignored so a late punch after auto-checkout
+    # cannot open a second check-in.
+    ONE_ATTENDANCE_PER_DAY = os.getenv("ONE_ATTENDANCE_PER_DAY", "true").lower() == "true"
+
     # ── Multi-company ──────────────────────────────────────────────────────────
     # Odoo company ID to create attendance records under.
     # Find it in Settings → Companies → [company] → URL bar.

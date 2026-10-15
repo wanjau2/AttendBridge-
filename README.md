@@ -10,10 +10,13 @@ AttendBridge is a lightweight Python/Flask server that bridges ZKTeco biometric 
 
 - **Native iClock/ADMS protocol** — no SDK, no vendor software required
 - **Odoo Online and self-hosted** — works with any Odoo 16/17/18 instance
-- **ZMM501-NF28VF firmware quirk** handled automatically (Verified field encodes direction)
+- **ZMM501-NF28VF firmware quirk** handled automatically (Verified field is mostly a verify method, not reliable in/out)
 - **Timezone-aware** — device sends local time; middleware converts to UTC for Odoo
-- **Duplicate punch guard** — ignores re-sends within 60 seconds
-- **Stale record recovery** — auto-closes forgotten check-ins from previous day
+- **Smart in/out** — second punch after `MIN_HOURS_BEFORE_CHECKOUT` closes the open attendance
+- **One attendance per day** — after check-out or auto-checkout, further punches that local day are ignored (no accidental second check-in)
+- **Auto-checkout sweep** — closes open attendances after `WORK_END_TIME` + grace (skips approved overtime)
+- **Duplicate punch guard** — ignores re-sends within 60 seconds; treats Odoo “already checked in” as success so the device can ACK and stop retrying
+- **Stale record recovery** — auto-closes forgotten check-ins from a previous day before opening today’s row
 - **Lateness tracking** — monthly occurrence counter with configurable disciplinary escalation
 - **Email notifications** — HTML emails to employees; CC HR on formal actions
 - **Odoo chatter notes** — every late arrival logged on the employee record
@@ -53,8 +56,8 @@ Should work with any ZKTeco device running firmware that supports the iClock/ADM
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/your-org/attendbridge.git
-cd attendbridge
+git clone https://github.com/wanjau2/AttendBridge-.git
+cd AttendBridge-
 pip install -r requirements.txt
 ```
 
@@ -129,11 +132,16 @@ All configuration is via environment variables, loaded from `.env` on startup.
 | `EMPLOYEE_MAP_FILE` | `./employee_map.json` | Path to PIN→employee_id map |
 | `WORK_START_TIME` | `08:00` | Work start time (HH:MM, 24hr) |
 | `LATE_GRACE_MINUTES` | `5` | Grace period before marking late |
-| `WORK_END_TIME` | `17:00` | Work end time (for display) |
+| `WORK_END_TIME` | `17:00` | Work end time (HH:MM); used by auto-checkout |
 | `LATENESS_STORE_FILE` | `./lateness_store.json` | Lateness occurrence persistence |
 | `WORK_DAYS` | `0,1,2,3,4` | Working days (0=Mon … 6=Sun) |
 | `MIN_HOURS_BEFORE_CHECKOUT` | `4.0` | Min hours before 2nd punch = checkout |
 | `CHECKOUT_AFTER_NOON` | `true` | Any punch after noon = checkout |
+| `ONE_ATTENDANCE_PER_DAY` | `true` | Max one in→out cycle per local calendar day |
+| `AUTO_CHECKOUT_ENABLED` | `true` | Background sweep closes open attendances after work end |
+| `AUTO_CHECKOUT_GRACE_MINUTES` | `15` | Minutes after `WORK_END_TIME` before auto-checkout runs |
+| `OVERTIME_APPROVAL_CATEGORY` | `Overtime` | Approvals category name; matching approved OT skips auto-checkout |
+| `ODOO_COMPANY_ID` | `0` | Company ID for multi-company DBs (`0` = user default) |
 | `SMTP_HOST` | _(blank = disabled)_ | SMTP server hostname |
 | `SMTP_PORT` | `587` | SMTP port |
 | `SMTP_USE_TLS` | `true` | Use STARTTLS |
@@ -144,6 +152,40 @@ All configuration is via environment variables, loaded from `.env` on startup.
 | `MANAGER_EMAIL` | — | CC'd from the 4th monthly lateness occurrence onward |
 | `MANAGER_CC_OCCURRENCE` | `4` | Occurrence at which the manager starts being CC'd |
 | `ADMIN_TOKEN` | _(blank = no auth)_ | Token for admin UI/API |
+
+---
+
+## Punch Processing
+
+AttendBridge decides check-in vs check-out from **Odoo state**, not only from the device direction field (which is unreliable on MB360 / ZMM501 firmware).
+
+### Daily cycle (with defaults)
+
+| Punch | Condition | Result |
+|---|---|---|
+| First of the local day | No attendance for that day | **Check-in** |
+| Later punch | Open attendance, under `MIN_HOURS_BEFORE_CHECKOUT` | Ignored (accidental re-tap) |
+| Later punch | Open attendance, at/after `MIN_HOURS_BEFORE_CHECKOUT` | **Check-out** |
+| Later punch | Already checked out or **auto-checked out** same day | Ignored (`ONE_ATTENDANCE_PER_DAY`) |
+| Next local calendar day | — | New check-in allowed |
+
+Local day boundaries use `DEVICE_TIMEZONE_OFFSET` (e.g. EAT = `3`), not UTC midnight.
+
+### Why one attendance per day?
+
+Without this rule, auto-checkout closes the open row at work end. A late punch (employee intending to “check out”) finds no open attendance and would open a **second check-in** for the evening. With `ONE_ATTENDANCE_PER_DAY=true`, that punch is skipped and the terminal still receives `OK`.
+
+Set `ONE_ATTENDANCE_PER_DAY=false` only if you need multiple in/out cycles per day (e.g. split shifts).
+
+### Auto-checkout
+
+When `AUTO_CHECKOUT_ENABLED=true`, a background sweep runs after `WORK_END_TIME` + `AUTO_CHECKOUT_GRACE_MINUTES` and closes open attendances. Employees with an approved overtime request (Approvals category matching `OVERTIME_APPROVAL_CATEGORY`) are skipped so they can still check out manually.
+
+Manual trigger: `POST /admin/auto-checkout`.
+
+### Device retries and “already checked in”
+
+ZKTeco terminals keep re-posting an ATTLOG line until the server responds with a body starting with `OK`. If Odoo rejects a create because the employee is already checked in, AttendBridge treats that as success, returns `OK`, and stops the retry loop. Unmapped PINs still return an error so the punch is held until the employee map is fixed.
 
 ---
 
@@ -242,19 +284,37 @@ docker run -d -p 8008:8008 --env-file .env -v $(pwd)/data:/app attendbridge
 | `POST` | `/admin/api/employees/reload` | Reload map from disk |
 | `GET` | `/admin/api/lateness` | Lateness store |
 | `GET` | `/admin/api/logs?n=200` | Last N log lines |
+| `POST` | `/admin/auto-checkout` | Run auto-checkout sweep once |
 
 ---
 
 ## Firmware Notes
 
-### ZMM501-NF28VF (Ver 1.0.8)
+### ZMM501-NF28VF (Ver 1.0.8) / MB360
 
-This firmware has a non-standard ATTLOG field mapping:
+On this firmware, ATTLOG `field[2]` is primarily a **verify method**, not a reliable in/out flag:
 
-- `field[2]` (Verified) encodes punch **direction**: `0` = Check-In, `1` = Check-Out
-- `field[3]` (Status) is always `1` and should be **ignored**
+| `field[2]` | Typical meaning |
+|---|---|
+| `0` | Password |
+| `1` | Fingerprint (also accepted as explicit check-out when sent that way) |
+| `4` / `15` | Face / other verify methods |
+| `255` | Automatic state |
 
-AttendBridge handles this automatically. Standard ZKTeco firmware (Status field for direction) is not currently supported but is a straightforward change — PRs welcome.
+`field[3]` (Status) is often always `1` and is **ignored**.
+
+AttendBridge therefore routes almost all punches through the **open-attendance** path described in [Punch Processing](#punch-processing). Face and similar codes are no longer discarded.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Log floods with `already checked in` every ~5s for the same PIN/time | Punch already in Odoo; middleware returned `ERROR` so the device retries | Deploy current AttendBridge (duplicate / already-checked-in → `OK`); restart middleware |
+| Evening punch creates a second check-in after auto-checkout | Open row was closed; new punch treated as check-in | Keep `ONE_ATTENDANCE_PER_DAY=true` (default) |
+| Check-out never closes | Punch too soon after check-in | Wait until ≥ `MIN_HOURS_BEFORE_CHECKOUT`, or lower that value |
+| PIN held / never ACK’d | PIN missing from `employee_map.json` | Map the PIN (`manage.py` / admin UI), then device will retry successfully |
 
 ---
 

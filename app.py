@@ -208,19 +208,21 @@ def health():
 
 def _direction_for(pin: str, field2: int) -> int:
     """
-    Return 0 (check-in path) or 1 (check-out path) for one ATTLOG field 2.
+    Return 0 (smart check-in path) or 1 (explicit check-out path).
 
-    0 and 1 keep the original meaning. Face punches arrive as 15 and were
-    previously discarded at DEBUG level after the terminal had already been
-    told the upload succeeded.
+    On ZMM501 field 2 is usually a verify method (password/fingerprint/face),
+    not a reliable in/out flag. Route everything through the check-in path,
+    which already toggles to check-out from open attendance + time rules.
+    Only keep field2==1 as an explicit check-out for devices that still send it.
     """
-    if field2 in EXPLICIT_DIRECTIONS:
-        return field2
+    if field2 == 1:
+        return 1
 
-    log.info(
-        "[AUTO] PIN=%s field2=%s — deciding in/out from open attendance",
-        pin, field2,
-    )
+    if field2 not in EXPLICIT_DIRECTIONS:
+        log.info(
+            "[AUTO] PIN=%s field2=%s — using open-attendance check-in path",
+            pin, field2,
+        )
     return 0
 
 
@@ -265,6 +267,26 @@ def _process_punch(line: str, sn: str) -> bool:
     return True
 
 
+def _local_day_bounds_utc(punch_time: datetime):
+    """
+    Return (day_start_utc, day_end_utc, local_date) for the device-local
+    calendar day that contains punch_time (UTC naive).
+    """
+    local = punch_time.replace(tzinfo=timezone.utc).astimezone(DEVICE_TZ)
+    start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local   = local.replace(hour=23, minute=59, second=59, microsecond=0)
+    day_start = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+    day_end   = end_local.astimezone(timezone.utc).replace(tzinfo=None)
+    return day_start, day_end, local.date()
+
+
+def _same_local_day(check_in_utc: datetime, punch_time: datetime) -> bool:
+    """Compare calendar days in device local time, not UTC."""
+    ci_local = check_in_utc.replace(tzinfo=timezone.utc).astimezone(DEVICE_TZ).date()
+    punch_local = punch_time.replace(tzinfo=timezone.utc).astimezone(DEVICE_TZ).date()
+    return ci_local == punch_local
+
+
 def _apply_check_in(pin: str, employee_id: int, punch_time: datetime):
     """
     Open a check-in, or turn this punch into a check-out when an open
@@ -276,16 +298,20 @@ def _apply_check_in(pin: str, employee_id: int, punch_time: datetime):
         seconds_since = (punch_time - check_in_utc).total_seconds()
         hours_since   = seconds_since / 3600.0
 
-        # Duplicate (rapid re-tap)
-        if seconds_since < 60:
-            log.warning(f"[DUP] Duplicate check-in PIN={pin} ({seconds_since:.0f}s after last) — ignored")
+        # Duplicate (rapid re-tap or device retry of the same stamp).
+        # Use abs() so a timezone skew on the stored check_in cannot miss this.
+        if abs(seconds_since) < 60:
+            log.warning(
+                f"[DUP] Duplicate check-in PIN={pin} "
+                f"({seconds_since:.0f}s vs open {open_rec['check_in']}) — ignored"
+            )
             return
 
         # 4h-rule: any same-day punch ≥ MIN_HOURS_BEFORE_CHECKOUT after an open
         # check-in is treated as a check-out, regardless of what the device's
         # direction field says. Evening exits on this firmware are not marked
         # as check-out.
-        same_day = check_in_utc.date() == punch_time.date()
+        same_day = _same_local_day(check_in_utc, punch_time)
         if same_day and hours_since >= Config.MIN_HOURS_BEFORE_CHECKOUT:
             odoo.check_out(employee_id, punch_time)
             log.info(
@@ -318,7 +344,25 @@ def _apply_check_in(pin: str, employee_id: int, punch_time: datetime):
             )
             return
 
-    odoo.check_in(employee_id, punch_time)
+    # After auto-checkout (or a real checkout), there is no open row. A further
+    # punch the same local day must not open a second check-in.
+    if Config.ONE_ATTENDANCE_PER_DAY:
+        day_start, day_end, local_date = _local_day_bounds_utc(punch_time)
+        existing = odoo.get_attendance_for_day(employee_id, day_start, day_end)
+        if existing:
+            state = "closed" if existing.get("check_out") else "open"
+            log.warning(
+                f"[SKIP] PIN={pin} already has {state} attendance on {local_date} "
+                f"(check_in={existing.get('check_in')}) — one cycle per day"
+            )
+            return
+
+    record_id = odoo.check_in(employee_id, punch_time)
+    if not record_id:
+        # Already present in Odoo (duplicate / already checked in) — ACK OK.
+        log.info(f"[DUP] employee_id={employee_id} PIN={pin} at {punch_time} UTC — already in Odoo")
+        return
+
     log.info(f"[IN]  employee_id={employee_id} PIN={pin} at {punch_time} UTC")
     _check_lateness(employee_id, pin, punch_time)
 
@@ -327,13 +371,22 @@ def _apply_check_out(pin: str, employee_id: int, punch_time: datetime):
     """Close the open attendance. An explicit check-out with nothing open is ignored."""
     open_rec = odoo.get_open_attendance(employee_id)
     if not open_rec:
+        if Config.ONE_ATTENDANCE_PER_DAY:
+            day_start, day_end, local_date = _local_day_bounds_utc(punch_time)
+            existing = odoo.get_attendance_for_day(employee_id, day_start, day_end)
+            if existing and existing.get("check_out"):
+                log.warning(
+                    f"[SKIP] PIN={pin} already checked out on {local_date} "
+                    f"(check_out={existing['check_out']}) — one cycle per day"
+                )
+                return
         log.warning(f"[SKIP] Check-out for PIN={pin} but no open record in Odoo — ignored")
         return
 
     check_in_utc  = datetime.strptime(open_rec["check_in"], "%Y-%m-%d %H:%M:%S")
     seconds_since = (punch_time - check_in_utc).total_seconds()
 
-    if seconds_since < 60:
+    if abs(seconds_since) < 60:
         log.warning(f"[DUP] Duplicate check-out PIN={pin} ({seconds_since:.0f}s after check-in) — ignored")
         return
 
@@ -495,7 +548,10 @@ def admin_auto_checkout():
 
 log.info("Starting MB360 → Odoo middleware")
 log.info(f"  Odoo: {Config.ODOO_URL}  DB: {Config.ODOO_DB}")
-log.info("  ATTLOG: field2 0/1 are explicit in/out; face and other codes use open attendance")
+log.info("  ATTLOG: field2=1 is explicit out; all other codes use open-attendance check-in path")
+log.info(
+    f"  One attendance/day: {'ON' if Config.ONE_ATTENDANCE_PER_DAY else 'OFF'}"
+)
 
 if Config.AUTO_CHECKOUT_ENABLED:
     log.info(

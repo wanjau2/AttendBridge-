@@ -51,13 +51,15 @@ class OdooClient:
         """Execute an XML-RPC call, reconnecting once on failure."""
         self._connect()
 
-        # Build context — inject company if configured
+        # Build context — inject company if configured.
+        # Force UTC so hr.attendance datetimes match the naive UTC values we write.
         kw = dict(kwargs or {})
+        ctx = dict(kw.get("context", {}))
+        ctx.setdefault("tz", "UTC")
         if self.company_id:
-            ctx = dict(kw.get("context", {}))
             ctx["allowed_company_ids"] = [self.company_id]
             ctx["force_company"]       = self.company_id
-            kw["context"] = ctx
+        kw["context"] = ctx
 
         try:
             return self._models.execute_kw(
@@ -75,12 +77,36 @@ class OdooClient:
     # ── hr.attendance helpers ──────────────────────────────────────────────────
 
     def check_in(self, employee_id: int, punch_time: datetime) -> int:
-        """Create a new open attendance record (check_in set, check_out empty)."""
+        """
+        Create a new open attendance record (check_in set, check_out empty).
+
+        Returns the new record id, or 0 when Odoo rejects a duplicate open
+        attendance (already checked in) — callers treat that as success so the
+        terminal can ACK and stop retrying the same punch.
+        """
+        if self.is_duplicate(employee_id, punch_time):
+            log.warning(
+                f"[ODOO] Duplicate check-in already exists for employee {employee_id} "
+                f"near {punch_time} — treating as success"
+            )
+            return 0
+
         vals = {
             "employee_id": employee_id,
             "check_in": punch_time.strftime(ODOO_DT_FORMAT),
         }
-        record_id = self._call("hr.attendance", "create", [vals])
+        try:
+            record_id = self._call("hr.attendance", "create", [vals])
+        except xmlrpc.client.Fault as e:
+            # Device retries the same ATTLOG until it gets OK. If the open
+            # row already exists, ACK as success instead of looping forever.
+            if "already checked in" in (e.faultString or "").lower():
+                log.warning(
+                    f"[ODOO] Employee {employee_id} already checked in "
+                    f"({e.faultString}) — treating as success"
+                )
+                return 0
+            raise
         log.debug(f"[ODOO] Created attendance id={record_id} for employee {employee_id}")
         return record_id
 
@@ -94,7 +120,9 @@ class OdooClient:
             "hr.attendance", "search_read",
             [[
                 ["employee_id", "=", employee_id],
+                "|",
                 ["check_out", "=", False],
+                ["check_out", "=", None],
             ]],
             {
                 "fields": ["id", "check_in"],
@@ -125,7 +153,9 @@ class OdooClient:
             "hr.attendance", "search_count",
             [[
                 ["employee_id", "=", employee_id],
+                "|",
                 ["check_out", "=", False],
+                ["check_out", "=", None],
             ]]
         )
         return count > 0
@@ -151,6 +181,35 @@ class OdooClient:
             ]]
         )
         return count > 0
+
+    def get_attendance_for_day(self, employee_id: int, day_start_utc: datetime, day_end_utc: datetime):
+        """
+        Return the latest hr.attendance whose check_in falls in [day_start, day_end]
+        (UTC naive), or None. Used for the one-attendance-per-day rule.
+        """
+        records = self._call(
+            "hr.attendance", "search_read",
+            [[
+                ["employee_id", "=", employee_id],
+                ["check_in", ">=", day_start_utc.strftime(ODOO_DT_FORMAT)],
+                ["check_in", "<=", day_end_utc.strftime(ODOO_DT_FORMAT)],
+            ]],
+            {
+                "fields": ["id", "check_in", "check_out"],
+                "order": "check_in desc",
+                "limit": 1,
+            }
+        )
+        if not records:
+            return None
+        rec = records[0]
+        if rec.get("check_in"):
+            rec["check_in"] = str(rec["check_in"])[:19]
+        if rec.get("check_out"):
+            rec["check_out"] = str(rec["check_out"])[:19]
+        else:
+            rec["check_out"] = None
+        return rec
 
     def get_employees(self):
         """Fetch all active employees. Returns list of {id, name} dicts."""
@@ -367,11 +426,14 @@ class OdooClient:
         or None if no open record exists.
         Returns dict with keys: id, check_in (UTC string "%Y-%m-%d %H:%M:%S")
         """
+        # Odoo stores empty check_out as False; some DBs also leave it unset.
         records = self._call(
             "hr.attendance", "search_read",
             [[
                 ["employee_id", "=", employee_id],
-                ["check_out",   "=", False],
+                "|",
+                ["check_out", "=", False],
+                ["check_out", "=", None],
             ]],
             {
                 "fields": ["id", "check_in"],
@@ -384,6 +446,6 @@ class OdooClient:
         rec = records[0]
         # Normalise check_in — Odoo returns a datetime string or False
         if rec.get("check_in"):
-            # Odoo may return "2026-04-28 05:30:00" (UTC naive string)
+            # With context tz=UTC this is a naive UTC string
             rec["check_in"] = str(rec["check_in"])[:19]
         return rec
