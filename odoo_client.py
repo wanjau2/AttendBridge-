@@ -33,7 +33,11 @@ class OdooClient:
             return
 
         log.info(f"[ODOO] Authenticating as {self.username} on {self.url}")
-        common = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/common")
+        # allow_none=True so accidental Python None in payloads does not crash;
+        # Odoo domains should still use False (not None) for empty fields.
+        common = xmlrpc.client.ServerProxy(
+            f"{self.url}/xmlrpc/2/common", allow_none=True
+        )
         uid = common.authenticate(self.db, self.username, self.password, {})
 
         if not uid:
@@ -44,7 +48,9 @@ class OdooClient:
 
         self._uid = uid
         self._common = common
-        self._models = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/object")
+        self._models = xmlrpc.client.ServerProxy(
+            f"{self.url}/xmlrpc/2/object", allow_none=True
+        )
         log.info(f"[ODOO] Authenticated. uid={uid}")
 
     def _call(self, model: str, method: str, args: list, kwargs: dict = None):
@@ -69,9 +75,14 @@ class OdooClient:
         except xmlrpc.client.Fault as e:
             log.error(f"[ODOO] XML-RPC fault: {e.faultString}")
             raise
-        except Exception as e:
+        except (ConnectionError, TimeoutError, OSError) as e:
+            # Only drop the session on real transport failures.
             self._uid = None
+            self._models = None
             log.warning(f"[ODOO] Connection error, will retry next call: {e}")
+            raise
+        except Exception as e:
+            log.warning(f"[ODOO] Call error ({model}.{method}): {e}")
             raise
 
     # ── hr.attendance helpers ──────────────────────────────────────────────────
@@ -120,9 +131,7 @@ class OdooClient:
             "hr.attendance", "search_read",
             [[
                 ["employee_id", "=", employee_id],
-                "|",
                 ["check_out", "=", False],
-                ["check_out", "=", None],
             ]],
             {
                 "fields": ["id", "check_in"],
@@ -153,9 +162,7 @@ class OdooClient:
             "hr.attendance", "search_count",
             [[
                 ["employee_id", "=", employee_id],
-                "|",
                 ["check_out", "=", False],
-                ["check_out", "=", None],
             ]]
         )
         return count > 0
@@ -426,14 +433,14 @@ class OdooClient:
         or None if no open record exists.
         Returns dict with keys: id, check_in (UTC string "%Y-%m-%d %H:%M:%S")
         """
-        # Odoo stores empty check_out as False; some DBs also leave it unset.
+        # Odoo stores empty check_out as False. Do not use Python None in the
+        # domain — xmlrpc cannot marshal it unless allow_none is enabled, and
+        # Odoo domains expect False for unset datetime fields.
         records = self._call(
             "hr.attendance", "search_read",
             [[
                 ["employee_id", "=", employee_id],
-                "|",
                 ["check_out", "=", False],
-                ["check_out", "=", None],
             ]],
             {
                 "fields": ["id", "check_in"],
