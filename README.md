@@ -313,6 +313,8 @@ AttendBridge therefore routes almost all punches through the **open-attendance**
 |---|---|---|
 | Log floods with `already checked in` every ~5s for the same PIN/time | Punch already in Odoo; middleware returned `ERROR` so the device retries | Deploy current AttendBridge (duplicate / already-checked-in → `OK`); restart middleware |
 | `cannot marshal None unless allow_none is enabled` | Domain used Python `None` in an XML-RPC call | Use `odoo_client.py` that queries `check_out = False` only; restart middleware |
+| `Activities have to be linked to records with a not null res_id` | Activity created with related `res_model` instead of `res_model_id` | Deploy fix that sets `res_model_id` + `user_id` on `mail.activity` |
+| Lateness emails/counts spike after a long outage | Device backlog replayed old days as “late today” | Current code skips lateness unless punch local date is today |
 | Evening punch creates a second check-in after auto-checkout | Open row was closed; new punch treated as check-in | Keep `ONE_ATTENDANCE_PER_DAY=true` (default) |
 | Check-out never closes | Punch too soon after check-in | Wait until ≥ `MIN_HOURS_BEFORE_CHECKOUT`, or lower that value |
 | PIN held / never ACK’d | PIN missing from `employee_map.json` | Map the PIN (`manage.py` / admin UI), then device will retry successfully |

@@ -295,8 +295,17 @@ class OdooClient:
         Create a mail.activity on the employee record assigned to HR.
         Appears as a to-do task on the HR dashboard in Odoo Online.
         Only called for formal actions (occurrence >= 3).
+
+        Odoo stores res_model as a related field from res_model_id, so XML-RPC
+        must set res_model_id (ir.model) or res_id is rejected as null.
         """
         from datetime import datetime as dt, timedelta
+        from config import Config
+
+        if not employee_id:
+            log.warning("[ODOO] Cannot create activity: employee_id is empty")
+            return False
+
         month_label = dt.strptime(month, "%Y-%m").strftime("%B %Y")
         date_label  = punch_time.strftime("%d %b %Y")
         due_date    = (punch_time + timedelta(days=3)).strftime("%Y-%m-%d")
@@ -310,31 +319,62 @@ class OdooClient:
         )
 
         try:
+            # Resolve ir.model id for hr.employee (required; res_model alone is related/readonly)
+            models = self._call(
+                "ir.model", "search_read",
+                [[["model", "=", "hr.employee"]]],
+                {"fields": ["id"], "limit": 1}
+            )
+            if not models:
+                log.warning("[ODOO] ir.model hr.employee not found — skip activity")
+                return False
+            res_model_id = models[0]["id"]
+
             # Find the To-Do activity type
             activity_types = self._call(
                 "mail.activity.type", "search_read",
-                [[["name", "ilike", "todo"]]],
+                [[["name", "ilike", "to-do"]]],
                 {"fields": ["id", "name"], "limit": 1}
             )
+            if not activity_types:
+                activity_types = self._call(
+                    "mail.activity.type", "search_read",
+                    [[["name", "ilike", "todo"]]],
+                    {"fields": ["id", "name"], "limit": 1}
+                )
             if not activity_types:
                 activity_types = self._call(
                     "mail.activity.type", "search_read",
                     [[]],
                     {"fields": ["id", "name"], "limit": 1}
                 )
-            activity_type_id = activity_types[0]["id"] if activity_types else 4
+            activity_type_id = activity_types[0]["id"] if activity_types else False
+            if not activity_type_id:
+                log.warning("[ODOO] No mail.activity.type found — skip activity")
+                return False
 
-            self._call(
-                "mail.activity", "create",
-                [{
-                    "res_model":        "hr.employee",
-                    "res_id":           employee_id,
-                    "activity_type_id": activity_type_id,
-                    "summary":          f"Disciplinary Action Required — {action}",
-                    "note":             note,
-                    "date_deadline":    due_date,
-                }]
-            )
+            vals = {
+                "res_model_id":     res_model_id,
+                "res_id":           int(employee_id),
+                "activity_type_id": activity_type_id,
+                "summary":          f"Disciplinary Action Required — {action}",
+                "note":             note,
+                "date_deadline":    due_date,
+                # Assign to the API user by default (uid is always a res.users id)
+                "user_id":          self._uid,
+            }
+
+            # Prefer an HR user if HR_EMAIL matches a login
+            if Config.HR_EMAIL:
+                hr_users = self._call(
+                    "res.users", "search_read",
+                    [[["login", "=", Config.HR_EMAIL]]],
+                    {"fields": ["id"], "limit": 1}
+                )
+                if hr_users:
+                    vals["user_id"] = hr_users[0]["id"]
+
+            self._call("mail.activity", "create", [vals])
             log.info(
                 f"[ODOO] Disciplinary activity created for employee {employee_id} "
                 f"| occurrence #{occurrence} | action: {action}"

@@ -401,11 +401,20 @@ def _check_lateness(employee_id: int, pin: str, punch_time: datetime):
     Compare punch_time (UTC) against the configured work start time.
     If late, record the occurrence, notify the employee, and log to Odoo.
     Skips weekends and non-working days per WORK_DAYS config.
+    Only evaluates punches for the current local calendar day so device
+    backlog replay does not inflate lateness counters or spam HR.
     """
     # Convert punch UTC back to local time for comparison
     local_punch = punch_time.replace(tzinfo=timezone.utc).astimezone(
         timezone(timedelta(hours=Config.DEVICE_TIMEZONE_OFFSET))
     )
+    today_local = datetime.now(DEVICE_TZ).date()
+    if local_punch.date() != today_local:
+        log.info(
+            f"[LATENESS] PIN={pin} punch date {local_punch.date()} "
+            f"!= today {today_local} — skip (backlog)"
+        )
+        return
 
     # Skip non-working days
     if local_punch.weekday() not in Config.WORK_DAYS:
@@ -420,7 +429,7 @@ def _check_lateness(employee_id: int, pin: str, punch_time: datetime):
     if local_punch <= deadline:
         return  # On time
 
-    minutes_late = int((local_punch - deadline).total_seconds() / 60)
+    minutes_late = max(1, int((local_punch - deadline).total_seconds() / 60))
     log.info(f"[LATENESS] PIN={pin} is {minutes_late} min late")
 
     # Record occurrence and get disciplinary action
@@ -439,15 +448,16 @@ def _check_lateness(employee_id: int, pin: str, punch_time: datetime):
 
     # Create Odoo Activity for HR on formal actions (occurrence 3+)
     if result["is_formal"]:
-        odoo.create_disciplinary_activity(
+        created = odoo.create_disciplinary_activity(
             employee_id, local_punch,
             result["occurrence"], result["month"],
             result["action"]
         )
-        log.info(
-            f"[LATENESS] Disciplinary activity created for {employee_name} "
-            f"| occurrence #{result['occurrence']} | {result['action']}"
-        )
+        if created:
+            log.info(
+                f"[LATENESS] Disciplinary activity created for {employee_name} "
+                f"| occurrence #{result['occurrence']} | {result['action']}"
+            )
 
     # Send email notification to employee
     if employee_email:
